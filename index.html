@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>澄文扫描台 · 文档漂白与保色</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="5" y="3" width="22" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M9 9h14M9 14h14M9 19h9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".75"/>
+        <path d="M19 22.5l3 3 5-6" stroke="#2fd1a0" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="brand-txt">
+        <h1>澄文扫描台</h1>
+        <p>漂白 · 保色 · 矫正 · 成册</p>
+      </div>
+    </div>
+
+    <div class="topstats">
+      <div class="stat"><b id="statPages">0</b><span>页</span></div>
+      <div class="stat"><b id="statSize">—</b><span>预计体积</span></div>
+      <div class="stat"><b id="statPer">—</b><span>单页均值</span></div>
+    </div>
+
+    <div class="topactions">
+      <button class="btn ghost" id="btnDemo">载入示例</button>
+      <button class="btn ghost" id="btnHelp">规范与算法</button>
+    </div>
+  </header>
+
+  <aside class="panel left">
+    <div class="scroll">
+    <section class="block">
+      <div class="block-title">导入</div>
+      <div class="dropmini" id="dropMini">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>拖入图片 / PDF，或点击选择</span>
+      </div>
+      <input type="file" id="fileInput" accept="image/*,application/pdf,.pdf" multiple hidden>
+    </section>
+
+    <section class="block">
+      <div class="block-title">增强模式</div>
+      <div class="seg" id="segMode">
+        <button data-mode="bleach" class="on">漂白</button>
+        <button data-mode="gray">灰度</button>
+        <button data-mode="color">彩色</button>
+      </div>
+      <div class="chips" id="presets">
+        <button data-preset="standard" class="on">标准</button>
+        <button data-preset="strong">强力</button>
+        <button data-preset="gentle">轻柔</button>
+        <button data-preset="archive">档案</button>
+      </div>
+      <div class="hint" id="modeHint">白底黑字，红头与印章仍为红色</div>
+    </section>
+
+    <section class="block">
+      <div class="block-title">参数<button class="link" id="btnReset">重置</button></div>
+
+      <label class="slider">
+        <span class="sl">漂白强度</span><b class="sv" id="vWhitening">1.00</b>
+        <input type="range" id="whitening" min="0.6" max="1.5" step="0.02" value="1">
+      </label>
+      <label class="slider">
+        <span class="sl">文字加深</span><b class="sv" id="vTextDark">1.05</b>
+        <input type="range" id="textDark" min="0.5" max="1.5" step="0.02" value="1.05">
+      </label>
+      <label class="slider">
+        <span class="sl">去阴影</span><b class="sv" id="vShadow">1.00</b>
+        <input type="range" id="shadow" min="0" max="1.5" step="0.02" value="1">
+      </label>
+      <label class="slider">
+        <span class="sl">局部对比</span><b class="sv" id="vContrast">1.00</b>
+        <input type="range" id="contrast" min="0.5" max="1.8" step="0.02" value="1">
+      </label>
+      <label class="slider">
+        <span class="sl">去噪点</span><b class="sv" id="vDenoise">1.0</b>
+        <input type="range" id="denoise" min="0" max="2" step="0.5" value="1">
+      </label>
+      <label class="slider">
+        <span class="sl">锐化</span><b class="sv" id="vSharpen">0.35</b>
+        <input type="range" id="sharpen" min="0" max="1" step="0.05" value="0.35">
+      </label>
+
+      <div class="swgrid">
+        <label class="sw wide2" title="按纸张状况选档：决定局部阈值的窗宽与系数，等同书格社区公开的那组实测预设"><i class="noop"></i><span>纸张状况</span>
+          <select id="presetSel" class="mini">
+            <option value="standard" selected>标准 · 一般扫描件</option>
+            <option value="clean">干净 · 底色均匀</option>
+            <option value="faded">淡墨 · 字迹浅淡</option>
+            <option value="stain">污渍 · 水渍霉斑</option>
+            <option value="shadow">阴影 · 拍照暗角</option>
+          </select>
+        </label>
+        <label class="sw" title="红头、印章、蓝章、彩色插图按原色保留"><input type="checkbox" id="keepColor" checked><i></i><span>保留红头/印章</span></label>
+        <label class="sw" title="自动找纸张四角并做透视校正"><input type="checkbox" id="autoQuad" checked><i></i><span>检测纸张边缘</span></label>
+        <label class="sw" title="裁掉扫描时带进来的四周黑边"><input type="checkbox" id="trimEdge" checked><i></i><span>去除边缘黑边</span></label>
+        <label class="sw" title="清掉贴着纸边的折痕、装订影、杂线"><input type="checkbox" id="edgeClean" checked><i></i><span>清理折痕/杂线</span></label>
+        <label class="sw" title="书刊摊开扫描成一张横图时，自动拆成左右两页"><input type="checkbox" id="splitSpread" checked><i></i><span>对开页拆分</span></label>
+        <label class="sw" title="文本轻微倾斜时自动摆正"><input type="checkbox" id="deskew" checked><i></i><span>自动纠偏</span></label>
+        <label class="sw" title="小字笔画断裂时做邻域补偿"><input type="checkbox" id="inkGrow"><i></i><span>断笔接续</span></label>
+        <label class="sw" title="按墨迹外框裁掉多余白边"><input type="checkbox" id="trim"><i></i><span>裁去白边</span></label>
+      </div>
+      <button class="btn wide" id="btnApplyAll">应用参数到全部页</button>
+    </section>
+
+    </div>
+    <div class="exportfoot">
+      <div class="foot-title">输出与导出</div>
+      <div class="trio">
+        <label><span>处理分辨</span>
+          <select id="resSel">
+            <option value="3508">3508px · A4 300dpi</option>
+            <option value="2600" selected>2600px · A4 222dpi</option>
+            <option value="2000">2000px · A4 171dpi</option>
+            <option value="1500">1500px · 快速预览</option>
+          </select>
+        </label>
+        <label><span>单页体积</span>
+          <select id="budgetSel">
+            <option value="80">80 KB</option>
+            <option value="150" selected>150 KB</option>
+            <option value="200">200 KB</option>
+            <option value="300">300 KB</option>
+            <option value="0">不限</option>
+          </select>
+        </label>
+        <label><span>页面</span>
+          <select id="pageSizeSel">
+            <option value="a4" selected>A4 居中</option>
+            <option value="orig">原比例</option>
+          </select>
+        </label>
+      </div>
+      <div class="expbox">
+        <div><span>页数</span><b id="expPages">0</b></div>
+        <div><span>合计</span><b id="expSize">—</b></div>
+        <div><span>编码</span><b id="expCodec">—</b></div>
+      </div>
+      <button class="btn primary wide" id="btnExportPdf">导出 PDF</button>
+      <button class="btn wide" id="btnExportImg">导出图片 ZIP</button>
+      <div class="privacy">全程本机处理 · 文件不上传</div>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <div class="toolbar">
+      <div class="tb-left">
+        <span class="pg-idx" id="pgIdx">—</span>
+        <span class="pg-name" id="pgName">尚未导入文件</span>
+      </div>
+      <div class="tb-right">
+        <button class="tool" id="btnAdjust" title="手动调框">调框</button>
+        <button class="tool" id="btnCompare" title="按住对比原图">按住对比</button>
+        <button class="tool" id="btnRotate" title="旋转 90°">旋转</button>
+        <button class="tool" id="btnRedetect" title="重新检测边缘">重检</button>
+        <button class="tool danger" id="btnDelete" title="删除本页">删除</button>
+      </div>
+    </div>
+
+    <div class="viewport" id="viewport">
+      <div class="empty" id="empty">
+        <div class="empty-inner">
+          <svg viewBox="0 0 64 64" width="72" height="72">
+            <rect x="12" y="6" width="40" height="52" rx="4" fill="none" stroke="currentColor" stroke-width="2" opacity=".5"/>
+            <path d="M20 18h24M20 27h24M20 36h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".35"/>
+            <circle cx="46" cy="47" r="11" fill="#0f141b" stroke="#3d8bff" stroke-width="2"/>
+            <path d="M41.5 47l3.2 3.2 6-6.4" stroke="#2fd1a0" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <h2>把手机拍的公文、合同、票据拖进来</h2>
+          <p>自动找纸边 → 透视拉正 → 抹掉台灯光和手影 → 漂成白纸黑字，红头与公章保持红色</p>
+          <div class="empty-actions">
+            <button class="btn primary" id="btnPick">选择文件</button>
+            <button class="btn" id="btnDemo2">载入示例</button>
+          </div>
+          <div class="empty-tags">JPG · PNG · WEBP · PDF（可多选）</div>
+        </div>
+      </div>
+
+      <div class="pagewrap" id="pageWrap" hidden>
+        <canvas id="cvFinal"></canvas>
+        <canvas id="cvRaw" class="raw" hidden></canvas>
+        <div class="cmpline" id="cmpLine" hidden></div>
+        <div class="quadlayer" id="quadLayer" hidden>
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+            <polygon id="quadPoly" points=""></polygon>
+          </svg>
+          <div class="handle" data-i="0"></div>
+          <div class="handle" data-i="1"></div>
+          <div class="handle" data-i="2"></div>
+          <div class="handle" data-i="3"></div>
+        </div>
+      </div>
+
+      <div class="badge" id="stageBadge" hidden>正在调框：拖动四角贴合纸张边缘</div>
+
+      <div class="busy" id="busy" hidden>
+        <div class="spinner"></div>
+        <div class="busy-txt" id="busyTxt">处理中…</div>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <span id="sbSize">—</span>
+      <span id="sbTime"></span>
+      <span id="sbNote"></span>
+      <span class="grow"></span>
+      <button class="zoombtn" id="zoomOut">−</button>
+      <span id="zoomVal">100%</span>
+      <button class="zoombtn" id="zoomIn">+</button>
+      <button class="zoombtn" id="zoomFit" title="适应窗口">⤢</button>
+    </div>
+  </main>
+
+  <aside class="panel right">
+    <div class="railhead">页面<span id="pageCount">0</span></div>
+    <div class="rail" id="rail"></div>
+    <button class="addbtn" id="btnAdd">+ 添加页面</button>
+  </aside>
+</div>
+
+<div class="dropmask" id="dropMask" hidden>
+  <div class="dropmask-inner">
+    <svg viewBox="0 0 24 24" width="34" height="34"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <b>松开即可导入</b>
+    <span>图片或 PDF，支持一次拖入多个</span>
+  </div>
+</div>
+
+<div class="modal" id="helpModal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2>规范依据与处理流程</h2>
+      <button class="close" id="btnCloseHelp">×</button>
+    </div>
+    <div class="modal-body">
+      <h3>一、这是怎么处理的</h3>
+      <ol class="steps">
+        <li><b>纸张四角检测</b>：光照归一化后用 Otsu 分出纸面，取最大连通域，凸包 + 极值点求四角，再以最小外接矩形兜底（可手动微调）。</li>
+        <li><b>透视校正</b>：单应矩阵反算，双线性重采样，把斜着拍的纸拉成正面矩形。</li>
+        <!-- modified：说明连续调限幅与保色通道限幅的实际行为。 -->
+        <li><b>去阴影 / 抹平底灰</b>：对灰度做形态学闭运算估计“光照背景”，再逐像素做除法归一化。漂白页执行完整校正；灰度/彩色页只做有限增益，并按最亮颜色通道防止截断，避免把照片中间调和大面积色块误当阴影漂白。</li>
+        <li><b>自适应二值化</b>：Sauvola 变体，按局部均值与标准差取阈值，小字、糊字不会被一刀切死；再用低墨量地板阈值把残影清零，得到真正的纯白。</li>
+        <li><b>保色通道</b>：对色度（chroma）显著且饱和度够高的像素单独走彩色分支，保持色相、提升纯度，因此红头、红章、蓝笔批注不会被二值化吃掉。</li>
+        <li><b>强制暗线的例外</b>：局部阈值的阈值恒低于局部均值，任何“大片均匀色块”（照片、粗标题、实心印章）都会被判成背景而整块翻白。因此对“局部背景本身也暗”的区域加一条绝对暗线兜底；限定“背景也暗”是为了不盖掉各档位与滑块的差异。</li>
+        <li><b>去噪 / 锐化</b>：删除孤立小连通域（不侵蚀笔画），对墨量做非锐化掩模，笔画更实更黑。</li>
+        <li><b>对开页拆分</b>：整幅横向图先找中缝（列梯度最宽的空带），再验证左右两半“各像一页”（版心居中），确认后拆成两页并各自重新取景。</li>
+        <li><b>成册</b>：黑白页用 1bit 位图 + Flate 压缩，并按剩余体积预算<b>放大后再二值化</b>（长边至多 3508px ≈ A4 300dpi）；灰度/彩色页用 JPEG 按目标体积二分搜索质量。多文件导入时按来源文件自动生成书签大纲。</li>
+        <li><b>印章分层</b>：漂白模式下，红头/印章的彩色像素从黑白层里摘出来，单独压成一层 1bit 掩膜，在 PDF 里用填充色画在黑白层之上 —— 页面仍是 1bit、仍能保持 300dpi，但红色不会变成黑块。掩膜同样做“墨量守恒”反算（否则放大后章名细笔画会碎成点），再补一道 1 像素形态学闭运算接断笔。</li>
+        <!-- modified：自检范围由首页扩展为全部页面。 -->
+        <li><b>导出后自检</b>：PDF 生成后立刻用 PDF 解析器回读一遍——结构层核对页数，渲染层把每一页都真的画出来；两层都过才提示“校验通过”。</li>
+      </ol>
+
+      <h3>一点五、纸张状况这五个档位</h3>
+      <p>局部二值化的效果几乎全由“窗宽”和“系数”两个参数决定。这里的五档来自书格社区公开的实测预设，但<b>不能照抄数值</b>：Wolf 与 Sauvola 的系数方向相反——Sauvola 的阈值是 <code>t = 均值 × (1 + k × (标准差/128 − 1))</code>，<b>k 越大阈值越低、出墨越少</b>。所以“淡墨”要调小 k，“污渍”要调大 k 并放大窗口。五档都按此换算并实测校准过。</p>
+      <p class="muted">实测（合成淡墨页，笔画仅比纸暗 62/232）：淡墨 4.88% &gt; 干净 2.14% &gt; 标准 0.35%。而笔画很实的页面五档结果一致——档位只对“临界”情况起作用，这正是它该有的行为。</p>
+
+      <h3>二、为什么默认 150KB / 页</h3>
+      <p><b>DA/T 31—2017《纸质档案数字化规范》</b>：扫描分辨率不小于 200dpi，文字偏小、密集、清晰度较差时建议不小于 300dpi；并明确 <b>“页面中有红头、印章或插有照片、彩色插图的档案，应采用彩色模式进行扫描”</b> —— 这正是本工具“漂白但保留红头印章颜色”的规范依据。</p>
+      <p>各地档案进馆的执行口径普遍是：<b>黑白二值 A4 单页 20–40KB，灰度或彩色 A4 单页 100–300KB</b>，彩色 PDF 单页上限 500KB。本工具默认 150KB，落在“彩色 100–300KB”区间中部，既满足移交要求，又便于微信/邮件传输。</p>
+      <p class="muted">若只是内部传阅，选 80KB 更省流量；若需长期存档或打印，选 300KB 或不限制，并把处理分辨调到 3508px（A4 300dpi）。处理分辨 2600px 约合 A4 222dpi，已满足 DA/T 31 的“不小于 200dpi”。</p>
+      <p class="muted">导出时若体积预算还有富余，1bit 位图会自动放大到更高像素密度再二值化——这不是“注水”，而是<b>用亚像素重采样换取平滑轮廓</b>：1bit 图像放大后出现的毛刺、粘连、断笔，根源就是边缘没有中间灰度，先放大再过阈值能从源头缓解（此经验来自马健 ComicEnhancerPro 长期实践）。放大倍率受“目标墨量”约束，笔画粗细与原尺寸保持一致。</p>
+
+      <h3>三、关于“文字 PDF”</h3>
+      <p>本工具输出的是<b>位图 PDF</b>（图像型），不做 OCR，因此 150KB 的目标是靠“1bit 压缩 + 分辨率控制”达成的，而不是把文字抽成文本层。位图 PDF 的好处是版式、印章、手写批注 100% 还原，任何终端打开都不会跑版。</p>
+      <p class="muted">如果确实需要可检索的文字层，建议在导出后再用 OCRmyPDF 套一层透明文字（<code>ocrmypdf --skip-text out.pdf final.pdf</code>），体积只会增加几十 KB。</p>
+
+      <h3>四、关于“真实性”</h3>
+      <p>扫描件的“真实性”不只是看起来清楚，还包括<b>内容有没有被算法悄悄改过</b>。这一行有个著名的坑：有损 JBIG2 压缩会在“相似即相同”的符号字典里把不同的字合并，压完可能出现错别字甚至丢内容，而且事后<b>除了与原件逐像素比对，没有任何技术手段能判断某页到底是有损还是无损压缩</b>。</p>
+      <p>本工具只使用 <b>Flate（zlib）无损压缩</b>，并且每次编码后都把压缩流解回来<b>与编码前的位图逐字节比对</b>（印章掩膜也一并验），通过后状态栏会显示“无损校验通过”。也就是说，导出文件里的每一个像素都能溯源到处理结果，不存在“看着一样、其实改过”的余地。</p>
+      <p>另一类“不真实”更隐蔽：<b>所见非所得</b>。二值化把红色压成黑块，页面看着完整，红头却已经不是红的了。本工具在导出时会把彩色像素单独成层，因此<b>预览里是什么颜色，PDF 里就是什么颜色</b>；若一页上同时存在多种颜色（彩色插页、多色批注），则自动退回彩色 JPEG，不做单色化猜测。</p>
+      <p><b>导出图片同理</b>：纯黑白页存 1 位 PNG（无损，一页约 17KB，比 24 位 PNG 小 16 倍）；带红头/印章的页存 24 位 PNG 以保住颜色，代价是体积大得多。纯黑白图<b>绝不能存 JPG</b>——JPEG 会在笔画边缘糊出一圈灰，属于典型的“看着一样、其实改过”。要兼顾体积与保色，请用 PDF。</p>
+
+      <h3>五、参考的开源方案</h3>
+      <p class="muted">算法思路参考了 ScanTailor Advanced（去底色 / 分页处理）、OpenCV 的四角检测与透视变换、Sauvola 自适应阈值论文实现，以及：
+        马健《ComicEnhancerPro》系列（先放大再二值化、墨量守恒、去除毛刺、MRC 分层）；
+        翁志艺《PDF 补丁丁》（重压缩的三条准入条件、页面尺寸与内容流分离、结构与渲染两层自检、按文件名生成书签）；
+        书格社区《智能图像预处理工具》与 ReadFree/HiPDA 的实操帖（Wolf 五档预设、形态学开闭去污、旧纸去底色）；
+        ScanTailor Spectre（Picture/Fill Zones 的分区处理范式）。整个前端流程为自研 JS 实现，不依赖任何后端与 WASM。</p>
+    </div>
+  </div>
+</div>
+
+<script src="core.js"></script>
+<script src="pdfout.js"></script>
+<script src="demo.js"></script>
+<script src="vendor/pdf.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

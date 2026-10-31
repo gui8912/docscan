@@ -1,0 +1,15 @@
+# 依赖（本项目零运行时依赖，装依赖只可能是本地临时调试）
+node_modules/
+package-lock.json
+
+# 导出产物与临时文件
+*.zip
+out.pdf
+out.zip
+*.log
+.DS_Store
+Thumbs.db
+
+# 审计/端到端测试的临时目录（Chrome 用户数据、导出的 PDF 等）
+_audit/
+.tmp/
