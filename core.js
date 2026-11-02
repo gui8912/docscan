@@ -1682,8 +1682,9 @@
   }
 
   var API = {
+    // modified：2.4.3 — 导出文件名与源文件一致、可写回源文件覆盖、导出后自动清空工作栏。
     // modified：2.4.2 — 复审修复彩色候选基准（泛黄纸整页判墨）、无损校验长度判定与公共设施问题。
-    version: '2.4.2',
+    version: '2.4.3',
     defaults: DEFAULTS,
     presets: PRESETS,
     process: process,

@@ -78,6 +78,46 @@
     setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 1500);
   }
 
+  /**
+   * 保存导出结果，按"能覆盖就覆盖"的顺序降级：
+   * ① 有源文件句柄 → createWritable() 写回原路径，真正覆盖源文件；
+   * ② 有系统另存对话框 → suggestedName 用源文件名，用户可在源目录里覆盖同名文件；
+   * ③ 都没有 → 普通下载（只能落到浏览器下载目录，无法覆盖）。
+   * 返回 { mode, name }，mode 为 overwrite / picker / download / cancel。
+   */
+  async function saveOutput(bytes, filename, mime, srcHandle) {
+    var blob = new Blob([bytes], { type: mime });
+    if (srcHandle && srcHandle.createWritable) {
+      try {
+        if (srcHandle.requestPermission) {
+          var perm = await srcHandle.requestPermission({ mode: 'readwrite' });
+          if (perm !== 'granted') throw new Error('未授予写入权限');
+        }
+        var w = await srcHandle.createWritable();
+        await w.write(blob);
+        await w.close();
+        return { mode: 'overwrite', name: srcHandle.name || filename };
+      } catch (e) {
+        if (e && e.name === 'AbortError') return { mode: 'cancel' };
+        console.warn('写回源文件失败，改用另存：', e);
+      }
+    }
+    if (window.showSaveFilePicker) {
+      try {
+        var h = await window.showSaveFilePicker({ suggestedName: filename });
+        var w2 = await h.createWritable();
+        await w2.write(blob);
+        await w2.close();
+        return { mode: 'picker', name: h.name || filename };
+      } catch (e2) {
+        if (e2 && e2.name === 'AbortError') return { mode: 'cancel' };
+        console.warn('另存失败，改用下载：', e2);
+      }
+    }
+    download(bytes, filename, mime);
+    return { mode: 'download', name: filename };
+  }
+
   var toastTimer = null;
   function toast(msg, kind) {
     var el = $('toastBox');
@@ -135,7 +175,7 @@
 
   /* ---------------- 导入 ---------------- */
 
-  function makePage(srcCanvas, name, kind) {
+  function makePage(srcCanvas, name, kind, srcHandle) {
     return {
       id: S.uuid++,
       name: name,
@@ -149,6 +189,9 @@
       enc: null,
       // modified：保存每页参数快照与任务序号，避免全局参数和异步旧任务污染导出。
       options: null,
+      // modified：记录源文件句柄（File System Access API）。导出时可写回原路径，
+      // 实现"覆盖源文件"；没有句柄时退化为另存/下载。
+      srcHandle: srcHandle || null,
       status: 'idle',
       _run: 0,
       _rot: -1,
@@ -263,28 +306,31 @@
     return [l, r];
   }
 
-  async function addFiles(files) {
+  async function addFiles(files, handles) {
     if (!files || !files.length) return;
     var added = [];
     busy(true, '正在读取文件…');
     for (var i = 0; i < files.length; i++) {
       var f = files[i];
+      // modified：源文件句柄与文件按顺序一一对应；缺少时保持 null（只能另存，不能覆盖）。
+      var fh = (handles && handles[i]) || null;
       try {
         if (/\.pdf$/i.test(f.name) || f.type === 'application/pdf') {
           var pages = await pdfToCanvases(f);
-          pages.forEach(function (it) { added.push(makePage(it.canvas, it.name, 'pdf')); });
+          // 同一个 PDF 拆出的多页共享一个源句柄，导出时可整体覆盖原 PDF。
+          pages.forEach(function (it) { added.push(makePage(it.canvas, it.name, 'pdf', fh)); });
         } else if (f.type.indexOf('image') === 0 || /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i.test(f.name)) {
           var c = await imageToCanvas(f);
           var parts = splitIfSpread(c);
           if (parts.length === 2) {
             var base = f.name.replace(/\.[^.]+$/, '');
-            var pl = makePage(parts[0], base + ' · 左页', 'image');
-            var pr = makePage(parts[1], base + ' · 右页', 'image');
+            var pl = makePage(parts[0], base + ' · 左页', 'image', fh);
+            var pr = makePage(parts[1], base + ' · 右页', 'image', fh);
             pl.noAutoQuad = true; pr.noAutoQuad = true;   // 已是精确裁切，跳过四角检测
             added.push(pl, pr);
             toast('检测到对开页，已拆为两页');
           } else {
-            added.push(makePage(c, f.name, 'image'));
+            added.push(makePage(c, f.name, 'image', fh));
           }
         }
       } catch (err) {
@@ -668,6 +714,43 @@
 
   /* ---------------- 导出 ---------------- */
 
+  /** 导出用的基础名：取第一页源文件名，去掉 " · 第N页 / 左页 / 右页" 与扩展名。 */
+  function exportBaseName() {
+    var first = S.pages[0];
+    if (!first) return '扫描件';
+    var n = String(first.name || '扫描件').split(' · ')[0];
+    return n.replace(/\.[^.]+$/, '').slice(0, 60) || '扫描件';
+  }
+
+  /** 全部页是否来自同一个 PDF 源文件；是则返回该句柄（导出可整体覆盖原 PDF）。 */
+  function sharedPdfHandle() {
+    if (!S.pages.length) return null;
+    var h = S.pages[0].srcHandle;
+    if (!h) return null;
+    for (var i = 0; i < S.pages.length; i++) {
+      var p = S.pages[i];
+      if (p.srcHandle !== h || p.kind !== 'pdf') return null;
+    }
+    return h;
+  }
+
+  /** 清空工作栏（文件查阅栏）与全部页面的处理结果，随后回到空状态。 */
+  function clearAll(silent) {
+    var n = S.pages.length;
+    // 主动断开 canvas / 编码缓存引用，让大图能尽快被回收
+    S.pages.forEach(function (p) {
+      p.src = null; p.result = null; p.rawWarp = null; p.enc = null;
+      p._rotCv = null; p._thumbSrc = null; p._thumbUrl = null; p.srcHandle = null;
+    });
+    S.pages = [];
+    S.cur = -1;
+    S.adjust = false; S.compare = false; S.zoom = 0; S.pendingApply = false;
+    renderRail();
+    render();
+    updateStats();
+    if (!silent) toast('已清空 ' + n + ' 页');
+  }
+
   // modified：自检扩展为全部页面，并确保成功、失败、页数不符时都释放 PDF 文档。
   /** 导出后自检：结构 + 渲染两层。返回 null 表示环境里没有 pdf.js，跳过。 */
   async function selfCheck(bytes, expect) {
@@ -735,7 +818,7 @@
           pageW: pw, pageH: ph, dw: dw, dh: dh, dx: dx, dy: dy
         });
       }
-      var title = (S.pages[0].name || '扫描件').replace(/\.[^.]+$/, '').slice(0, 60);
+      var title = exportBaseName();
       // 按来源文件分组挂书签；单组时不挂（一个书签没有意义）
       var bms = [], lastBase = null;
       for (var j = 0; j < S.pages.length; j++) {
@@ -751,11 +834,21 @@
       busy(true, '正在校验导出结果…');
       var chk = await selfCheck(bytes, S.pages.length);
       if (chk && chk.ok === false) throw new Error('导出校验失败：' + chk.why);
-      download(bytes, title + '_扫描版.pdf', 'application/pdf');
+      // modified：文件名与源文件一致；有源 PDF 句柄时写回原文件，实现覆盖。
+      var srcH = sharedPdfHandle();
+      if (srcH && !confirm('将覆盖源文件：\n' + (srcH.name || (title + '.pdf')) + '\n\n确定覆盖？')) {
+        busy(false);
+        return;
+      }
+      var saved = await saveOutput(bytes, title + '.pdf', 'application/pdf', srcH);
+      if (saved.mode === 'cancel') { busy(false); return; }
       busy(false);
       toast('已导出 ' + S.pages.length + ' 页 · ' + fmtSize(bytes.length) +
+        (saved.mode === 'overwrite' ? ' · 已覆盖源文件' : '') +
         (chk === null ? ' · 当前环境未回读校验' : ' · 校验通过'),
         chk === null ? 'error' : undefined);
+      // modified：导出成功后自动清空工作栏（文件查阅栏）
+      clearAll(true);
     } catch (e) {
       console.error(e);
       busy(false);
@@ -804,14 +897,18 @@
         await tick(1);
       }
       var zip = DocScanPDF.zip(files);
-      var title = (S.pages[0].name || '扫描件').replace(/\.[^.]+$/, '').slice(0, 60);
-      download(zip, title + '_图片.zip', 'application/zip');
+      var title = exportBaseName();
+      // modified：ZIP 无法覆盖单张源图，用源名另存；导出成功后自动清空工作栏。
+      var saved = await saveOutput(zip, title + '.zip', 'application/zip', null);
+      if (saved.mode === 'cancel') { busy(false); return; }
       busy(false);
       var formats = [];
       if (pngCount) formats.push(pngCount + ' 张 PNG（无损）');
       if (jpgCount) formats.push(jpgCount + ' 张 JPEG');
       toast('已导出 ' + files.length + ' 张图片：' + formats.join('、') +
         (keptColor ? '；其中 ' + keptColor + ' 张保留彩色' : ''));
+      // modified：导出成功后自动清空工作栏（文件查阅栏）
+      clearAll(true);
     } catch (e) {
       busy(false);
       toast('导出失败：' + e.message, 'error');
@@ -823,9 +920,40 @@
   function bind() {
     // 导入
     $('fileInput').onchange = function (e) { addFiles(e.target.files); e.target.value = ''; };
-    $('dropMini').onclick = function () { $('fileInput').click(); };
-    $('btnPick').onclick = function () { $('fileInput').click(); };
-    $('btnAdd').onclick = function () { $('fileInput').click(); };
+    // modified：优先用 showOpenFilePicker，能拿到文件句柄，导出时才可覆盖源文件；
+    // 不支持的环境回退到隐藏的 <input type=file>（只有文件名，无法覆盖）。
+    async function pickFiles() {
+      if (window.showOpenFilePicker) {
+        try {
+          var hs = await window.showOpenFilePicker({
+            multiple: true,
+            types: [{
+              description: '图片或 PDF',
+              accept: {
+                'application/pdf': ['.pdf'],
+                'image/jpeg': ['.jpg', '.jpeg'],
+                'image/png': ['.png'],
+                'image/webp': ['.webp'],
+                'image/bmp': ['.bmp'],
+                'image/gif': ['.gif'],
+                'image/tiff': ['.tif', '.tiff']
+              }
+            }]
+          });
+          var files = [];
+          for (var i = 0; i < hs.length; i++) files.push(await hs[i].getFile());
+          addFiles(files, hs);
+          return;
+        } catch (err) {
+          if (err && err.name === 'AbortError') return;   // 用户取消，不当错误处理
+          console.warn('showOpenFilePicker 失败，回退 input：', err);
+        }
+      }
+      $('fileInput').click();
+    }
+    $('dropMini').onclick = pickFiles;
+    $('btnPick').onclick = pickFiles;
+    $('btnAdd').onclick = pickFiles;
 
     function hasFiles(e) {
       var dt = e.dataTransfer;
@@ -856,12 +984,36 @@
       dragDepth = Math.max(0, dragDepth - 1);
       if (!dragDepth || !e.relatedTarget) { dragDepth = 0; showMask(false); }
     });
-    window.addEventListener('drop', function (e) {
+    // modified：拖拽时尽量取到源文件句柄（File System Access API）。
+    // 有句柄，导出才能写回原路径实现"覆盖源文件"；取不到就退化为另存/下载。
+    window.addEventListener('drop', async function (e) {
       if (!hasFiles(e)) return;
       e.preventDefault();
       dragDepth = 0;
       showMask(false);
-      if (e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+      var files = [], handles = [];
+      var items = e.dataTransfer.items;
+      if (items && items.length) {
+        var pending = [];
+        for (var i = 0; i < items.length; i++) {
+          var it = items[i];
+          if (it.kind !== 'file') continue;
+          var f = it.getAsFile ? it.getAsFile() : null;
+          if (!f) continue;
+          files.push(f);
+          // 句柄必须在事件的用户激活期内同步发起申请，等 await 之后再调用会丢上下文
+          pending.push(it.getAsFileSystemHandle
+            ? it.getAsFileSystemHandle().catch(function () { return null; })
+            : Promise.resolve(null));
+        }
+        handles = await Promise.all(pending);
+      } else if (e.dataTransfer.files) {
+        for (var j = 0; j < e.dataTransfer.files.length; j++) {
+          files.push(e.dataTransfer.files[j]);
+          handles.push(null);
+        }
+      }
+      if (files.length) addFiles(files, handles);
     });
 
     // 模式
@@ -969,6 +1121,12 @@
       if (S.cur >= S.pages.length) S.cur = S.pages.length - 1;
       S.adjust = false;
       renderRail(); render(); updateStats();
+    };
+    // modified：清空任务——清空工作栏里全部页面与处理结果，属于破坏性操作，先确认。
+    $('btnClearAll').onclick = function () {
+      if (!S.pages.length) { toast('当前没有任务'); return; }
+      if (!confirm('确定清空全部 ' + S.pages.length + ' 页？未导出的处理结果会丢失。')) return;
+      clearAll();
     };
 
     // 对比
