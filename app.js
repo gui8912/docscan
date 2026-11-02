@@ -149,6 +149,158 @@
     }
   }
 
+  /* ---------------- 参数持久化 ---------------- */
+
+  // modified：2.4.5 — 上次使用的设定存进 localStorage，刷新/重启浏览器后自动还原。
+  // 只记"界面设定"，不记文件和处理结果（那是临时数据，也不该占存储配额）。
+  // 注意：localStorage 按 origin 隔离，http://127.0.0.1:8765 与 8766 互不相通。
+  var SETTINGS_KEY = 'docscan.settings.v1';
+
+  // 需要记住的控件：滑杆（range）、开关（checkbox）、下拉（select）各按类型处理。
+  // 新增控件时把 id 加进这个列表即可，采集/还原/保存三处都不用改。
+  var PERSIST_IDS = [
+    'whitening', 'textDark', 'shadow', 'contrast', 'denoise', 'sharpen',
+    'keepColor', 'autoQuad', 'trimEdge', 'edgeClean', 'splitSpread', 'deskew',
+    'inkGrow', 'trim',
+    'presetSel', 'resSel', 'budgetSel', 'pageSizeSel'
+  ];
+
+  var MODE_HINT = {
+    bleach: '白底黑字，红头与印章仍为红色',
+    gray: '灰阶输出，保留照片层次',
+    color: '仅去阴影，最大限度保真'
+  };
+
+  /** 切换增强模式并同步按钮高亮与提示文案（原来这三件事散落在按钮 onclick 里）。 */
+  function setMode(mode) {
+    if (!MODE_HINT[mode]) return;
+    S.mode = mode;
+    var seg = $('segMode');
+    if (seg) Array.prototype.forEach.call(seg.children, function (x) {
+      x.classList.toggle('on', x.dataset.mode === mode);
+    });
+    if ($('modeHint')) $('modeHint').textContent = MODE_HINT[mode];
+  }
+
+  function collectSettings() {
+    var o = { v: 1, mode: S.mode };
+    for (var i = 0; i < PERSIST_IDS.length; i++) {
+      var el = $(PERSIST_IDS[i]);
+      if (!el) continue;
+      if (el.type === 'checkbox') o[PERSIST_IDS[i]] = el.checked;
+      else if (el.type === 'range') o[PERSIST_IDS[i]] = +el.value;
+      else o[PERSIST_IDS[i]] = el.value;
+    }
+    return o;
+  }
+
+  /** 还原上次设定。返回是否真的还原成功（没有存档、存档损坏都算失败，走默认值）。 */
+  function restoreSettings() {
+    var raw = null;
+    try { raw = localStorage.getItem(SETTINGS_KEY); } catch (e) { return false; }
+    if (!raw) return false;
+    var o;
+    try { o = JSON.parse(raw); } catch (e) { return false; }
+    if (!o || typeof o !== 'object') return false;
+
+    for (var i = 0; i < PERSIST_IDS.length; i++) {
+      var id = PERSIST_IDS[i], el = $(id);
+      if (!el || !(id in o)) continue;
+      if (el.type === 'checkbox') {
+        if (typeof o[id] === 'boolean') el.checked = o[id];
+      } else if (el.type === 'range') {
+        var n = +o[id];
+        if (!isFinite(n)) continue;
+        // 夹到滑杆区间内：旧版本存的值可能落在当前 min/max 之外
+        if (el.min !== '' && n < +el.min) n = +el.min;
+        if (el.max !== '' && n > +el.max) n = +el.max;
+        el.value = n;
+      } else if (el.options) {
+        // 只接受下拉里真实存在的项，免得手改过或旧版存档把控件置空
+        var v = String(o[id]), ok = false;
+        for (var j = 0; j < el.options.length; j++) {
+          if (el.options[j].value === v) { ok = true; break; }
+        }
+        if (ok) el.value = v;
+      }
+    }
+    if (o.mode) setMode(o.mode);
+    return true;
+  }
+
+  /**
+   * 滑杆值若与某个预设完全一致就高亮它，否则全部不高亮。
+   * 恢复出来的值往往不等于任何预设，若沿用 HTML 里写死的高亮，会出现
+   * "数值早已不是标准档、按钮却还亮着标准"的误导。
+   */
+  function syncPresetHighlight() {
+    var box = $('presets');
+    if (!box) return;
+    var hit = '';
+    Object.keys(PRESETS).forEach(function (name) {
+      var pr = PRESETS[name];
+      var same = Object.keys(pr).every(function (k) {
+        var el = $(k);
+        if (!el) return false;
+        // 预设里的值不一定落在滑杆的 step 网格上（例如 textDark 1.05 配 step 0.02），
+        // 浏览器会把它夹到最近的合法值 1.06。这里按同样规则取整再比，
+        // 否则"标准"档永远匹配不上，按钮不会高亮。
+        var min = el.min === '' ? 0 : +el.min;
+        var step = el.step === '' ? 0.01 : +el.step;
+        var want = min + Math.round((pr[k] - min) / step + 1e-9) * step;
+        return Math.abs(+el.value - want) < 1e-6;
+      });
+      if (same) hit = name;
+    });
+    Array.prototype.forEach.call(box.children, function (b) {
+      b.classList.toggle('on', b.dataset.preset === hit);
+    });
+  }
+
+  /**
+   * 恢复出厂设置：滑杆、开关、下拉全部回到 index.html 里写死的初始值。
+   * 用 DOM 自带的 defaultValue / defaultChecked / defaultSelected 取值，
+   * 不在 JS 里再抄一份默认值——两处各写一遍迟早会不同步。
+   */
+  function resetAllSettings() {
+    for (var i = 0; i < PERSIST_IDS.length; i++) {
+      var el = $(PERSIST_IDS[i]);
+      if (!el) continue;
+      if (el.type === 'checkbox') el.checked = el.defaultChecked;
+      else if (el.type === 'range') el.value = el.defaultValue;
+      else if (el.options) {
+        for (var j = 0; j < el.options.length; j++) {
+          if (el.options[j].defaultSelected) { el.value = el.options[j].value; break; }
+        }
+      }
+    }
+    setMode('bleach');
+    syncLabels();
+    syncPresetHighlight();
+    S.res = +$('resSel').value;
+    S.budget = +$('budgetSel').value;
+    S.pageSize = $('pageSizeSel').value || 'a4';
+    // 重置后的值同样要成为"下次的设定"，否则刷新又回到重置前的状态
+    saveSettings();
+  }
+
+  var saveTimer = null;
+
+  function flushSettings() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(collectSettings()));
+    } catch (e) {
+      // 隐私模式、配额满、或浏览器禁用了存储：静默降级，只是这次记不住，不影响使用
+    }
+  }
+
+  function saveSettings() {
+    // 拖滑杆会连续触发 input，合并成一次写入，避免高频同步 IO
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushSettings, 200);
+  }
+
   /* ---------------- 状态读取 ---------------- */
 
   function readOpts() {
@@ -667,6 +819,8 @@
       S.res = 2600; $('resSel').value = '2600';
       S.budget = 300; $('budgetSel').value = '300';
     }
+    // 直接给控件赋值不会触发 input/change，事件委托收不到，这里显式存一次
+    saveSettings();
   }
 
   /* ---------------- 调框拖拽 ---------------- */
@@ -1026,11 +1180,9 @@
     // 模式
     Array.prototype.forEach.call($('segMode').children, function (b) {
       b.onclick = function () {
-        S.mode = b.dataset.mode;
-        Array.prototype.forEach.call($('segMode').children, function (x) { x.classList.toggle('on', x === b); });
-        $('modeHint').textContent = S.mode === 'bleach' ? '白底黑字，红头与印章仍为红色'
-          : S.mode === 'gray' ? '灰阶输出，保留照片层次' : '仅去阴影，最大限度保真';
+        setMode(b.dataset.mode);
         queueReprocess();
+        saveSettings();
       };
     });
 
@@ -1047,7 +1199,13 @@
         queueReprocess();
       });
     });
-    $('btnReset').onclick = function () { setPreset('standard'); queueReprocess(); };
+    // modified：重置改为恢复"全部"默认（原来只重置滑杆，开关和下拉不动）。
+    // 加了自动记忆之后，用户需要一个能真正回到出厂的出口。
+    $('btnReset').onclick = function () {
+      resetAllSettings();
+      queueReprocess();
+      toast('已恢复默认参数，并记为下次的设定');
+    };
 
     // 开关（deskew / inkGrow 原先漏绑，切换后不重算）
     ['keepColor', 'trim', 'trimEdge', 'edgeClean', 'deskew', 'inkGrow'].forEach(function (id) {
@@ -1077,6 +1235,18 @@
     $('pageSizeSel').onchange = function () { S.pageSize = this.value; };
     // 纸张状况档位直接改变局部阈值的窗宽与系数，必须重算而不是只重编码
     $('presetSel').onchange = function () { queueReprocess(); };
+
+    // 参数自动记忆：走事件委托而不是逐个绑定，
+    // 以后新增任何滑杆/开关/下拉都不用再补一行保存调用，不会漏。
+    // 用 setTimeout 合并，拖滑杆时的连续 input 只写一次。
+    document.addEventListener('input', saveSettings);
+    document.addEventListener('change', saveSettings);
+    // 关页面/切后台时把还没落盘的合并写入立刻刷掉，
+    // 否则拖完滑杆 200ms 内直接关标签页，最后一次调整会丢。
+    window.addEventListener('pagehide', flushSettings);
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') flushSettings();
+    });
 
     $('btnApplyAll').onclick = async function () {
       if (!S.pages.length) return;
@@ -1239,12 +1409,17 @@
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
       } catch (e) { /* ignore */ }
     }
+    // modified：先还原上次设定，再同步标签与内部状态，最后才绑定事件。
+    // 顺序不能颠倒：若先绑事件，还原时写控件值虽不触发事件，但后续 syncLabels
+    // 会拿旧值渲染；若在还原前 setPreset('standard')，会把用户上次的滑杆值冲掉。
+    restoreSettings();
     syncLabels();
     S.budget = +$('budgetSel').value;
     S.res = +$('resSel').value;
+    S.pageSize = $('pageSizeSel').value || 'a4';
+    syncPresetHighlight();
     bind();
     render();
-    setPreset('standard');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
