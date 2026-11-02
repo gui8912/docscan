@@ -367,14 +367,21 @@
     var opts = p.options || readOpts();
     var source = p.result;
     var mode = opts.mode, keepColor = opts.keepColor;
+    // modified：输出长边上限跟随"处理分辨"，不再让编码器兜底到 3508。
+    // 原先这里不传 maxSide，pdfout 恒取 3508，于是用户选 2000/2600 时处理阶段
+    // 真降了采样，导出阶段又被放大回 3508 —— 三档体积几乎没有差别，选小档
+    // 等于白选。这里让用户所选的分辨成为硬上限，选 2000 就真的输出 2000。
+    var maxSide = opts.maxDim || 3508;
     var enc = p.enc;
-    if (!enc || enc._source !== source || enc._budget !== S.budget || enc._mode !== mode || enc._kc !== keepColor) {
-      enc = await DocScanPDF.encodePage(source, { budget: S.budget, mode: mode, color: keepColor });
+    // modified：缓存键必须带上 maxSide。源图小于档位时处理画布不变（_source 相同），
+    // 若不加这一项，改小分辨后仍会命中旧编码，导出尺寸不会跟着变。
+    if (!enc || enc._source !== source || enc._budget !== S.budget || enc._mode !== mode || enc._kc !== keepColor || enc._maxSide !== maxSide) {
+      enc = await DocScanPDF.encodePage(source, { budget: S.budget, mode: mode, color: keepColor, maxSide: maxSide });
       if (!enc) throw new Error('页面编码失败');
       if (enc.type === 'flate1bit' && enc.verify === false) throw new Error('无损回读校验失败，已阻止导出');
       if (enc.red && !enc.redBytes) throw new Error('彩色掩膜编码失败，已阻止导出');
       enc._source = source;
-      enc._budget = S.budget; enc._mode = mode; enc._kc = keepColor;
+      enc._budget = S.budget; enc._mode = mode; enc._kc = keepColor; enc._maxSide = maxSide;
       if (p.result !== source) return encodeForPage(p);
       p.enc = enc;
     }
