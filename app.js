@@ -87,35 +87,51 @@
    */
   async function saveOutput(bytes, filename, mime, srcHandle) {
     var blob = new Blob([bytes], { type: mime });
+    // modified：FileSystemWritableFileStream 的 close() 才真正提交文件（MDN：写入先在
+    // 临时交换文件里进行）。原实现在 write/close 抛错后既不 abort 也不 close，
+    // 可写流悬空、临时文件残留；且失败被静默降级成"成功"，调用方照样清空工作栏。
+    // 参照 MDN createWritable 示例的 try/catch + abort 写法补齐。
     if (srcHandle && srcHandle.createWritable) {
+      var w = null, closed = false;
       try {
         if (srcHandle.requestPermission) {
           var perm = await srcHandle.requestPermission({ mode: 'readwrite' });
           if (perm !== 'granted') throw new Error('未授予写入权限');
         }
-        var w = await srcHandle.createWritable();
+        w = await srcHandle.createWritable();
         await w.write(blob);
         await w.close();
+        closed = true;
         return { mode: 'overwrite', name: srcHandle.name || filename };
       } catch (e) {
+        if (w && !closed) { try { await w.abort(); } catch (ignored) { /* 已失效 */ } }
         if (e && e.name === 'AbortError') return { mode: 'cancel' };
         console.warn('写回源文件失败，改用另存：', e);
       }
     }
     if (window.showSaveFilePicker) {
+      var h = null, w2 = null, closed2 = false;
       try {
-        var h = await window.showSaveFilePicker({ suggestedName: filename });
-        var w2 = await h.createWritable();
+        h = await window.showSaveFilePicker({ suggestedName: filename });
+        w2 = await h.createWritable();
         await w2.write(blob);
         await w2.close();
+        closed2 = true;
         return { mode: 'picker', name: h.name || filename };
       } catch (e2) {
+        if (w2 && !closed2) { try { await w2.abort(); } catch (ignored2) { /* 已失效 */ } }
         if (e2 && e2.name === 'AbortError') return { mode: 'cancel' };
         console.warn('另存失败，改用下载：', e2);
       }
     }
-    download(bytes, filename, mime);
-    return { mode: 'download', name: filename };
+    // modified：download 抛错时返回 failed，让调用方保留工作栏，避免"没导出成功却清空"。
+    try {
+      download(bytes, filename, mime);
+      return { mode: 'download', name: filename };
+    } catch (e3) {
+      console.warn('触发下载失败：', e3);
+      return { mode: 'failed', name: filename };
+    }
   }
 
   var toastTimer = null;
@@ -224,7 +240,10 @@
         if (ok) el.value = v;
       }
     }
-    if (o.mode) setMode(o.mode);
+    // modified：只接受 MODE_HINT 的自有属性。原写法 setMode('toString') 会命中
+    // Object.prototype 上的函数（truthy），把 S.mode 污染成 'toString' 并把函数
+    // 源码写进 modeHint，导致三个模式按钮全不高亮、readOpts().mode 被带坏。
+    if (o.mode && Object.prototype.hasOwnProperty.call(MODE_HINT, o.mode)) setMode(o.mode);
     return true;
   }
 
@@ -402,22 +421,32 @@
     var out = [];
     var base = file.name.replace(/\.pdf$/i, '');
     // modified：任何一页读取或渲染失败都释放 PDF 文档，避免反复导入耗尽内存。
+    // 原实现把整段循环放在一个 try 里：第 20 页失败会把前 19 页已渲染的 canvas
+    // 全部丢弃、整份 PDF 不导入，用户只看到一条文件名报错。改为逐页容错，
+    // 成功页保留，并把跳过页数挂在返回数组上（不改变数组本身的接口）。
+    var skipped = 0;
     try {
       for (var i = 1; i <= doc.numPages; i++) {
-        var page = await doc.getPage(i);
-        var vp1 = page.getViewport({ scale: 1 });
-        // 目标约 200dpi：A4 = 595pt 宽 → 1654px
-        var scale = Math.min(3, 1654 / vp1.width);
-        var vp = page.getViewport({ scale: scale });
-        var c = document.createElement('canvas');
-        c.width = Math.round(vp.width);
-        c.height = Math.round(vp.height);
-        var ctx = c.getContext('2d');
-        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
-        await page.render({ canvasContext: ctx, viewport: vp }).promise;
-        out.push({ canvas: c, name: base + ' · 第' + i + '页' });
+        try {
+          var page = await doc.getPage(i);
+          var vp1 = page.getViewport({ scale: 1 });
+          // 目标约 200dpi：A4 = 595pt 宽 → 1654px
+          var scale = Math.min(3, 1654 / vp1.width);
+          var vp = page.getViewport({ scale: scale });
+          var c = document.createElement('canvas');
+          c.width = Math.round(vp.width);
+          c.height = Math.round(vp.height);
+          var ctx = c.getContext('2d');
+          ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+          await page.render({ canvasContext: ctx, viewport: vp }).promise;
+          out.push({ canvas: c, name: base + ' · 第' + i + '页' });
+        } catch (ePage) {
+          skipped++;
+          console.warn('第 ' + i + ' 页渲染失败，已跳过：', ePage);
+        }
         if (doc.numPages > 1) await tick(1);
       }
+      out.skipped = skipped;
       return out;
     } finally {
       await doc.destroy();
@@ -460,54 +489,65 @@
 
   async function addFiles(files, handles) {
     if (!files || !files.length) return;
+    // modified：busy 遮罩只覆盖中间舞台，左栏「添加页面」/拖拽在处理期间仍可点。
+    // 原实现无重入保护，两次并发导入会交错写 S.pages/S.cur，且共用单一布尔 busy，
+    // 先结束的那份提前解锁。这里在入口拦住重入。
+    if (S.busy) { toast('正在处理，请稍候再添加文件'); return; }
     var added = [];
+    // modified：整段包进 try/finally。原来 renderRail/render 若在 try 外抛错，
+    // S.busy 会永久为 true、遮罩卡死、pendingApply 永不补跑。
     busy(true, '正在读取文件…');
-    for (var i = 0; i < files.length; i++) {
-      var f = files[i];
-      // modified：源文件句柄与文件按顺序一一对应；缺少时保持 null（只能另存，不能覆盖）。
-      var fh = (handles && handles[i]) || null;
-      try {
-        if (/\.pdf$/i.test(f.name) || f.type === 'application/pdf') {
-          var pages = await pdfToCanvases(f);
-          // 同一个 PDF 拆出的多页共享一个源句柄，导出时可整体覆盖原 PDF。
-          pages.forEach(function (it) { added.push(makePage(it.canvas, it.name, 'pdf', fh)); });
-        } else if (f.type.indexOf('image') === 0 || /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i.test(f.name)) {
-          var c = await imageToCanvas(f);
-          var parts = splitIfSpread(c);
-          if (parts.length === 2) {
-            var base = f.name.replace(/\.[^.]+$/, '');
-            var pl = makePage(parts[0], base + ' · 左页', 'image', fh);
-            var pr = makePage(parts[1], base + ' · 右页', 'image', fh);
-            pl.noAutoQuad = true; pr.noAutoQuad = true;   // 已是精确裁切，跳过四角检测
-            added.push(pl, pr);
-            toast('检测到对开页，已拆为两页');
-          } else {
-            added.push(makePage(c, f.name, 'image', fh));
+    try {
+      for (var i = 0; i < files.length; i++) {
+        var f = files[i];
+        // modified：源文件句柄与文件按顺序一一对应；缺少时保持 null（只能另存，不能覆盖）。
+        var fh = (handles && handles[i]) || null;
+        try {
+          if (/\.pdf$/i.test(f.name) || f.type === 'application/pdf') {
+            var pages = await pdfToCanvases(f);
+            // modified：部分页渲染失败时保留成功页，并明确告知跳过了几页。
+            if (pages.skipped) toast(f.name + '：' + pages.skipped + ' 页渲染失败，已跳过', 'error');
+            // 同一个 PDF 拆出的多页共享一个源句柄，导出时可整体覆盖原 PDF。
+            pages.forEach(function (it) { added.push(makePage(it.canvas, it.name, 'pdf', fh)); });
+          } else if (f.type.indexOf('image') === 0 || /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i.test(f.name)) {
+            var c = await imageToCanvas(f);
+            var parts = splitIfSpread(c);
+            if (parts.length === 2) {
+              var base = f.name.replace(/\.[^.]+$/, '');
+              var pl = makePage(parts[0], base + ' · 左页', 'image', fh);
+              var pr = makePage(parts[1], base + ' · 右页', 'image', fh);
+              pl.noAutoQuad = true; pr.noAutoQuad = true;   // 已是精确裁切，跳过四角检测
+              added.push(pl, pr);
+              toast('检测到对开页，已拆为两页');
+            } else {
+              added.push(makePage(c, f.name, 'image', fh));
+            }
           }
+        } catch (err) {
+          toast(f.name + '：' + err.message, 'error');
         }
-      } catch (err) {
-        toast(f.name + '：' + err.message, 'error');
+        busy(true, '正在读取文件 ' + (i + 1) + '/' + files.length + '…');
+        await tick(2);
       }
-      busy(true, '正在读取文件 ' + (i + 1) + '/' + files.length + '…');
-      await tick(2);
-    }
-    if (!added.length) { busy(false); render(); return; }
+      if (!added.length) { render(); return; }
 
-    S.pages = S.pages.concat(added);
-    S.cur = S.pages.length - added.length;
-    renderRail();
-    render();
-    await tick(10);
-    for (var k = 0; k < added.length; k++) {
-      var p = added[k];
-      var idx = S.pages.indexOf(p);
-      busy(true, '处理第 ' + (idx + 1) + ' / ' + S.pages.length + ' 页…');
-      await processPage(p);
+      S.pages = S.pages.concat(added);
+      S.cur = S.pages.length - added.length;
       renderRail();
+      render();
+      await tick(10);
+      for (var k = 0; k < added.length; k++) {
+        var p = added[k];
+        var idx = S.pages.indexOf(p);
+        busy(true, '处理第 ' + (idx + 1) + ' / ' + S.pages.length + ' 页…');
+        await processPage(p);
+        renderRail();
+      }
+      render();
+      updateStats();
+    } finally {
+      busy(false);
     }
-    busy(false);
-    render();
-    updateStats();
   }
 
   /* ---------------- 处理 ---------------- */
@@ -861,7 +901,10 @@
       el.addEventListener('pointerup', async function () {
         if (dragging !== i) return;
         dragging = null;
+        // modified：这是全文件唯一未对 current() 判空的处理器。拖拽期间若点了
+        // 「清空任务」/「删除本页」，S.cur=-1 → p=null → async 回调里抛 TypeError。
         var p = current();
+        if (!p) return;
         p.quadManual = true;
         busy(true, '按新边框重新矫正…');
         await processPage(p);
@@ -880,7 +923,13 @@
     var first = S.pages[0];
     if (!first) return '扫描件';
     var n = String(first.name || '扫描件').split(' · ')[0];
-    return n.replace(/\.[^.]+$/, '').slice(0, 60) || '扫描件';
+    // modified：名字会直接进 showSaveFilePicker 的 suggestedName 与 a.download。
+    // 正常 File.name 不含路径分隔符，但调试入口 __docscan.addCanvas 允许任意 name；
+    // 这里做纵深防御：去掉非法字符、前导点和 Windows 保留名。
+    n = n.replace(/\.[^.]+$/, '').slice(0, 60)
+      .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').replace(/^\.+/, '').trim();
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(n)) n = '_' + n;
+    return n || '扫描件';
   }
 
   /** 全部页是否来自同一个 PDF 源文件；是则返回该句柄（导出可整体覆盖原 PDF）。 */
@@ -898,8 +947,14 @@
   /** 清空工作栏（文件查阅栏）与全部页面的处理结果，随后回到空状态。 */
   function clearAll(silent) {
     var n = S.pages.length;
-    // 主动断开 canvas / 编码缓存引用，让大图能尽快被回收
+    // modified：清空会置 p.src / p.result = null，但原来没有作废在途异步任务、
+    // 也没有取消防抖定时器。结果：处理中的 processPage 醒来后拿到 null 画布抛错，
+    // 被 catch 吞成"处理失败"提示；busy(false) 还会补跑一次 queueReprocess。
+    // 这里给每页递增代次（processPage 用 p._run 判定过期），并清掉待触发的定时器。
+    clearTimeout(applyTimer);
+    applyTimer = null;
     S.pages.forEach(function (p) {
+      p._run = (p._run || 0) + 1;
       p.src = null; p.result = null; p.rawWarp = null; p.enc = null;
       p._rotCv = null; p._thumbSrc = null; p._thumbUrl = null; p.srcHandle = null;
     });
@@ -1003,9 +1058,16 @@
       }
       var saved = await saveOutput(bytes, title + '.pdf', 'application/pdf', srcH);
       if (saved.mode === 'cancel') { busy(false); return; }
+      // modified：保存链路彻底失败时不能清空工作栏，否则处理结果不可恢复。
+      if (saved.mode === 'failed') {
+        busy(false);
+        toast('导出失败，文件未写出；工作栏已保留，可重试', 'error');
+        return;
+      }
       busy(false);
       toast('已导出 ' + S.pages.length + ' 页 · ' + fmtSize(bytes.length) +
         (saved.mode === 'overwrite' ? ' · 已覆盖源文件' : '') +
+        (saved.mode === 'download' ? ' · 已触发下载' : '') +
         (chk === null ? ' · 当前环境未回读校验' : ' · 校验通过'),
         chk === null ? 'error' : undefined);
       // modified：导出成功后自动清空工作栏（文件查阅栏）
@@ -1062,6 +1124,12 @@
       // modified：ZIP 无法覆盖单张源图，用源名另存；导出成功后自动清空工作栏。
       var saved = await saveOutput(zip, title + '.zip', 'application/zip', null);
       if (saved.mode === 'cancel') { busy(false); return; }
+      // modified：与 PDF 导出一致，失败时保留工作栏。
+      if (saved.mode === 'failed') {
+        busy(false);
+        toast('导出失败，文件未写出；工作栏已保留，可重试', 'error');
+        return;
+      }
       busy(false);
       var formats = [];
       if (pngCount) formats.push(pngCount + ' 张 PNG（无损）');
@@ -1163,9 +1231,11 @@
           if (!f) continue;
           files.push(f);
           // 句柄必须在事件的用户激活期内同步发起申请，等 await 之后再调用会丢上下文
-          pending.push(it.getAsFileSystemHandle
-            ? it.getAsFileSystemHandle().catch(function () { return null; })
-            : Promise.resolve(null));
+          // modified：getAsFileSystemHandle() 可能同步抛（SecurityError / 非用户激活 / 实现差异），
+          // 原写法只 .catch 兜 rejection，同步抛会中断整个 drop 回调，已收集的文件全部不导入。
+          var hp = null;
+          try { if (it.getAsFileSystemHandle) hp = it.getAsFileSystemHandle(); } catch (eH) { hp = null; }
+          pending.push(Promise.resolve(hp).catch(function () { return null; }));
         }
         handles = await Promise.all(pending);
       } else if (e.dataTransfer.files) {
@@ -1249,6 +1319,8 @@
     });
 
     $('btnApplyAll').onclick = async function () {
+      // modified：忙时禁止重入，避免两轮批处理共用单一布尔 busy 提前解锁。
+      if (S.busy) { toast('正在处理，请稍候'); return; }
       if (!S.pages.length) return;
       // modified：整批只取一次参数，批处理途中拖滑杆不会让前后页参数不一致。
       var snap = readOpts();
@@ -1292,6 +1364,8 @@
       renderRail(); render();
     };
     $('btnDelete').onclick = function () {
+      // modified：忙时禁止破坏性操作，否则在途 processPage 会拿到已被删除的页对象。
+      if (S.busy) { toast('正在处理，请稍候'); return; }
       var p = current();
       if (!p) return;
       S.pages.splice(S.cur, 1);
@@ -1301,6 +1375,8 @@
     };
     // modified：清空任务——清空工作栏里全部页面与处理结果，属于破坏性操作，先确认。
     $('btnClearAll').onclick = function () {
+      // modified：忙时禁止清空（遮罩只覆盖舞台，左栏按钮仍可点），避免与在途任务竞态。
+      if (S.busy) { toast('正在处理，请稍候'); return; }
       if (!S.pages.length) { toast('当前没有任务'); return; }
       if (!confirm('确定清空全部 ' + S.pages.length + ' 页？未导出的处理结果会丢失。')) return;
       clearAll();
@@ -1380,8 +1456,10 @@
     window.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') { $('helpModal').hidden = true; }
       // modified：滑杆/下拉/输入框获得焦点时，方向键属于控件本身，不能再翻页。
+      // 补上 button（点完「旋转」「调框」后焦点常驻留）与 contenteditable。
       var tag = (e.target && e.target.tagName || '').toLowerCase();
-      if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
+      if (tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'button' ||
+          (e.target && e.target.isContentEditable)) return;
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         if ($('helpModal').hidden === false) return;
         var d = e.key === 'ArrowLeft' ? -1 : 1;
@@ -1397,7 +1475,12 @@
 
     // 便于自检/演示：index.html#demo 直接载入示例
     var zm = /zoom=([\d.]+)/.exec(location.hash);
-    if (zm) { S.zoom = parseFloat(zm[1]); }
+    // modified：URL hash 里的 zoom 原样赋给 S.zoom，#zoom=999999999 会让
+    // layoutStage 算出 2.6e9 px 的样式宽度拖垮布局；与 zoomIn/Out 一样夹到 [0.08,4]。
+    if (zm) {
+      var zv = parseFloat(zm[1]);
+      if (isFinite(zv) && zv > 0) S.zoom = Math.max(0.08, Math.min(4, zv));
+    }
     if (/demo/.test(location.hash)) setTimeout(loadDemo, 350);
   }
 

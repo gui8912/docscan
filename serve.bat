@@ -1,21 +1,23 @@
 @echo off
-chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
-set PORT=8765
+if not defined PORT set PORT=8765
 
-echo 澄文扫描台 - 本地预览服务
-echo 目录: %cd%
-echo 地址: http://127.0.0.1:%PORT%/
+echo Chengwen DocScan - local preview server
+echo Folder: %cd%
+echo URL:    http://127.0.0.1:%PORT%/
 echo.
-echo 若浏览器比服务先打开、显示"无法访问"，刷新一次即可。
+echo If the browser opens before the server is ready, just refresh once.
+echo See README.md and the Chinese guide beside this script for details.
 echo.
 
-rem 优先用自带的零依赖服务：MIME、缓存与路径校验都由本项目负责
+rem Prefer the project's own zero-dependency server: it owns MIME, cache and path checks.
 where node >nul 2>nul
 if %errorlevel%==0 goto useNode
 
-echo 未找到 Node.js，改用 Python 静态服务器...
+echo Node.js not found. Falling back to Python http.server (reduced features).
+where python >nul 2>nul
+if errorlevel 1 goto noRuntime
 start "" "http://127.0.0.1:%PORT%/"
 python -m http.server %PORT% --bind 127.0.0.1
 goto done
@@ -23,8 +25,14 @@ goto done
 :useNode
 start "" "http://127.0.0.1:%PORT%/"
 node serve.js
+goto done
+
+:noRuntime
+echo Neither Node.js nor Python was found.
+echo Install Node.js, then run: node serve.js
+goto done
 
 :done
 echo.
-echo 服务已停止。按任意键关闭。
+echo Server stopped. Press any key to close.
 pause >nul

@@ -23,7 +23,7 @@
 | Node.js | 16+（仅用于启动本地静态服务，可不装，改用 Python） |
 | Python | 3.x（可选，`python -m http.server` 兜底） |
 
-> 浏览器门槛主要来自 `CompressionStream` / `DecompressionStream`。缺少它们时程序不会崩：1-bit 页会退化成 JPEG，同时**无法做无损回读校验**，状态栏不会出现"无损校验通过"。重要档案请用支持的浏览器。
+> 浏览器门槛主要来自 `CompressionStream` / `DecompressionStream`，两者要**分开看**：缺 `CompressionStream` 时 1-bit 页才退化成 JPEG；只缺 `DecompressionStream` 时仍以 `flate1bit` 导出，但 `verify` 为 `null`（无法回读校验），状态栏不会出现"无损校验通过"。2.4.6 起校验为三态：解压抛错或字节不符一律 `verify=false` 并**阻止导出**，只有环境确实不支持解压才返回 `null`。重要档案请用支持的浏览器。
 
 **必须通过 HTTP 打开，不能双击 `index.html`。** 直接 `file://` 打开时，PDF.js 的 worker 会被同源策略拦住，导致 PDF 导入失败、导出自检被跳过。
 
@@ -96,10 +96,14 @@ python -m http.server 8765 --bind 127.0.0.1
 ## 自检与验证
 
 ```bash
-node tools/selftest.js      # 10 项内核断言，纯 Node，无浏览器依赖
+node tools/selftest.js      # 19 项断言，纯 Node，无浏览器依赖
+# 或 npm test
 ```
+2.4.6 起自检同时 require `core.js` 与 `pdfout.js`（此前只测内核，导出层的位运算与无损校验完全没覆盖）。
 
-覆盖：细线保护、灰度/彩色的中间调与色相、连续调不改像素、实心块墨量守恒、多色页红蓝共存、泛黄纸不被整页判墨、五档出墨顺序、极端尺寸不崩溃。
+覆盖：细线保护、灰度/彩色的中间调与色相、连续调不改像素、实心块墨量守恒、多色页红蓝共存、泛黄纸不被整页判墨（含 1×1 小样本）、五档出墨不再塌成同一结果、极端尺寸与空数据、下采样不污染输入、`stats.ms` 非负、非法 preset 降级；以及**导出层**的 `maskClose` 与逐像素 3×3 形态学对照（定向反例 + 200 组随机）、CRC32 已知向量、ZIP 结构/文件名净化/DOS 日期、完好与损坏 Flate 流的三态校验。
+
+> 含 `DecompressionStream` 的两项异步断言在 Node 18+ 才真正执行；更低版本会明确打印 `skip`，不会伪装成通过。
 
 界面侧的人工验证（约 5 分钟）：
 
@@ -129,6 +133,9 @@ node tools/selftest.js      # 10 项内核断言，纯 Node，无浏览器依赖
 14. **2000px 档低于档案行业标准底线**：DA/T 31—2017 第 9.4.2 条要求扫描分辨率不小于 200dpi。3508px ≈ A4 300dpi、2600px ≈ 222dpi 均达标，2000px ≈ 171dpi **不达标**，只宜用于屏幕阅读或内部传阅。
 15. **导入端有 3000px 上限**（`app.js` 的 `SOURCE_MAX`）：长边超过 3000 的源图会先降采样再处理。因此即便选 3508px 档，若源图长边大于 3000，最终是「降采样后再插值放大」，并未保留源图的全部像素。要严格保留 300dpi 原生细节，需把 `SOURCE_MAX` 提到 3508 以上（代价是每页内存从约 25MB 升到约 35MB）。
 16. **PDF 导入固定按约 200dpi 渲染**（A4 宽 1654px，`app.js` 的 `pdfToCanvases`）。导入 300dpi 的 PDF 会先降到 200dpi 再处理，细节有损失；需要 300dpi 存档时，应直接导入原始 JPG/PNG 图片，而不是 PDF。
+17. **导出成功即清空工作栏，且不可撤销**（2.4.3 起）。要先导出 PDF 再导出图片 ZIP，得重新导入一次。2.4.6 起只有保存链路彻底失败才保留工作栏；`download` 分支无法确认文件是否真的落盘，提示语已标明"已触发下载"，请确认下载完成后再关闭页面。
+18. **静态服务只做词法路径校验**：`serve.js` 会拒绝 `..`、以点开头的隐藏文件与控制字符，但**不解析符号链接**。不要把指向目录外的软链放进本目录。服务仅绑 `127.0.0.1`，不要改成 `0.0.0.0`。
+19. **Python 回退路径能力较弱**：`serve.bat` 在找不到 Node 时才用 `python -m http.server`，该方式没有 MIME 控制、路径边界与隐藏文件拦截，仅供应急；正式使用请装 Node 并走 `node serve.js`。
 
 ## 目录结构
 
@@ -139,9 +146,10 @@ core.js           图像内核：四角检测 / 透视 / 纠偏 / 光照 / 二�
 pdfout.js         PDF 组装、1-bit Flate 编码、印章掩膜、JPEG 预算搜索、ZIP
 app.js            交互层：导入、逐页处理、参数快照、导出与自检
 demo.js           合成示例（红头文件 + 手机拍摄效果）
-serve.js          零依赖静态服务（仅 127.0.0.1）
-serve.bat         Windows 一键启动
-tools/selftest.js 内核自检（node tools/selftest.js）
+serve.js          零依赖静态服务（仅 127.0.0.1，含路径/隐藏文件/方法校验）
+serve.bat         Windows 一键启动（纯 ASCII + CRLF，优先 node）
+启动本地服务.txt   serve.bat 的中文说明（UTF-8 BOM）
+tools/selftest.js 19 项自检，覆盖内核 + 导出层（node tools/selftest.js）
 vendor/           PDF.js 3.11.174（本地内置，不联网）
 samples/          两份可复现的样例 PDF
 ```

@@ -61,7 +61,9 @@
   };
 
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
-  function now() { return global.performance ? performance.now() : Date.now(); }
+  // modified：条件判断走 global.performance，取值却用裸标识符 performance，
+  // 是两条不同的解析路径；统一取 global 上的对象，严格模式下也不依赖隐式全局。
+  function now() { return global.performance ? global.performance.now() : Date.now(); }
 
   /* ============================================================
    * 一、基础转换
@@ -81,8 +83,17 @@
    * 故保留单趟，仅把内层的区间计算换成查表。
    */
   function downsampleRGBA(src, sw, sh, maxDim) {
+    // modified：空尺寸/非法 maxDim 会让 scale 变 NaN，进而产出 {w:NaN,h:NaN} 破坏
+    // w/h/data 一致性契约；直接返回原数据的空副本，让调用方走正常空态。
+    if (!(sw > 0 && sh > 0) || !isFinite(maxDim) || maxDim <= 0) {
+      return { data: new Uint8ClampedArray(src), w: sw | 0, h: sh | 0 };
+    }
     var scale = Math.min(1, maxDim / Math.max(sw, sh));
-    if (scale >= 0.999) return { data: src, w: sw, h: sh };
+    // modified：早退分支原先直接 return src，而 process 会原地改写 data[p] *= gi。
+    // 实测长边 2001px + maxDim 2000 时命中此分支（scale=0.9995），调用方的原始
+    // 像素被改成 246；app.js 又复用同一份 warp 做预览与重处理，形成累积漂移。
+    // 这里无条件复制一份，保证「纯函数」语义。
+    if (scale >= 0.999) return { data: new Uint8ClampedArray(src), w: sw, h: sh };
 
     var dw = Math.max(1, Math.round(sw * scale));
     var dh = Math.max(1, Math.round(sh * scale));
@@ -567,7 +578,12 @@
     for (var y = 0; y < h; y++) {
       var acc = 0, base = y + pad, row = y * w;
       for (var x = 0; x < w; x++) {
-        if (bin[row + x]) proj[base + (acc >> 16)]++;
+        // modified：TypedArray 越界写不抛错也不生效，会静默丢掉末尾若干列的打分。
+        // pad/pad2 已按角度上界预留，这里再兜一层，避免将来改角度范围时复发。
+        if (bin[row + x]) {
+          var bi = base + (acc >> 16);
+          if (bi >= 0 && bi < bins) proj[bi]++;
+        }
         acc += step;
       }
     }
@@ -578,6 +594,9 @@
   }
 
   function estimateSkew(data, w, h, maxDeg) {
+    // modified：空图时 dark/n 是 0/0=NaN，后续所有比较恒假，会一路走到
+    // 精搜并返回一个无意义的 -9°（实测）。入口直接返回 0 角。
+    if (!(w > 0 && h > 0) || !data || data.length < w * h * 4) return 0;
     maxDeg = maxDeg || 8;
     var ds = downscaleGrayFast(data, w, h, 420);
     var sw = ds.w, sh = ds.h, gray = ds.g;
@@ -611,7 +630,10 @@
         var nm = gray2[i] * 240 / (bg2[i] < 12 ? 12 : bg2[i]);
         if (nm < 150) bin2[i] = 1;
       }
-      var pad2 = Math.ceil(sw2 * Math.tan(maxDeg * Math.PI / 180)) + 2;
+      // modified：精搜上界是 c+1，粗解 c 可达 ±maxDeg，实际角度会到 maxDeg+1。
+    // pad2 原按 maxDeg 算，proj[base + (acc>>16)] 在 13° 时越界（TypedArray 静默丢弃），
+    // 该角度得分被低估。按 maxDeg+1 预留余量即可覆盖两端。
+    var pad2 = Math.ceil(sw2 * Math.tan((maxDeg + 1) * Math.PI / 180)) + 2;
       var bins2 = sh2 + pad2 * 2;
       var c = bestA, bestS2 = -1, bestA2 = c;
       for (var a2 = c - 1; a2 <= c + 1 + 1e-9; a2 += 0.1) {
@@ -1357,10 +1379,21 @@
 
   function process(srcData, sw, sh, options) {
     var o = {}, k;
-    for (k in DEFAULTS) o[k] = DEFAULTS[k];
-    if (options) for (k in options) if (options[k] !== undefined) o[k] = options[k];
-
-    var t0 = now();
+    for (k in DEFAULTS) if (Object.prototype.hasOwnProperty.call(DEFAULTS, k)) o[k] = DEFAULTS[k];
+    // modified：for-in 会把 options 原型上的属性也拷进来；且 preset='constructor' 之类
+    // 会命中 Object.prototype 上的函数，使 pset.k 变 undefined → 阈值全 NaN → 整页变白。
+    // 一律只收自有属性，preset 另做白名单校验（见下方读取处）。
+    if (options) for (k in options) {
+      if (Object.prototype.hasOwnProperty.call(options, k) && options[k] !== undefined) o[k] = options[k];
+    }
+    // modified：空数据不进入流水线（否则 downsample/estimateSkew 产出 NaN 尺寸）。
+    // 返回一张 1x1 白像素，保证调用方 toCanvas / 导出链路仍有合法画布。
+    if (!(sw > 0 && sh > 0) || !srcData || srcData.length < sw * sh * 4) {
+      var empty = new Uint8ClampedArray(4);
+      empty[0] = empty[1] = empty[2] = empty[3] = 255;
+      return { data: empty, w: 1, h: 1, stats: { inkRatio: 0, skew: 0, ms: 0, msDeskew: 0, edgeCut: 0, edgeBlobs: 0 } };
+    }
+    var tStart = now();
     var tDeskew = 0, skew = 0;
 
     /* --- 0. 自动纠偏（在已透视矫正的图上工作） --- */
@@ -1439,7 +1472,8 @@
     if (continuousMode) {
       var continuous = processContinuous(data, gray, w, h, o);
       continuous.stats.skew = skew;
-      continuous.stats.ms = now() - t0;
+      // modified：同步计时起点的改名（t0 → tStart），连续调提前返回分支同样要改。
+      continuous.stats.ms = now() - tStart;
       continuous.stats.msDeskew = tDeskew;
       continuous.stats.edgeCut = edgeCut;
       continuous.stats.edgeBlobs = 0;
@@ -1447,7 +1481,8 @@
     }
 
     /* --- 2. Sauvola 阈值图（半分辨率） --- */
-    var pset = PRESETS[o.preset] || PRESETS.standard;
+    // modified：preset 必须是自有属性，否则 'constructor'/'toString' 会命中原型链上的函数。
+    var pset = Object.prototype.hasOwnProperty.call(PRESETS, o.preset) ? PRESETS[o.preset] : PRESETS.standard;
     var kSau = pset.k + 0.12 * (o.contrast - 1);
     var hwMin = Math.min(w, h) >> 1;
     var winR = Math.max(3, Math.round(hwMin * pset.win / 100));
@@ -1488,10 +1523,16 @@
           chN++;
         }
       }
+      // modified：中位数命中条件原为 chAcc >= chNeed，而 chNeed = chN>>1。
+      // 单像素图 chNeed=0 时 chAcc>=0 恒真 → chMed 恒取 0 → 基线退回 34，
+      // 泛黄纸重新被整页判墨；偶数样本且两色各半时也会偏到较小值。
+      // 与同文件 detectSpread 的中位数写法保持一致，改用严格大于，并对空样本兜底。
       var chNeed = chN >> 1, chAcc = 0, chMed = 0;
-      for (var chi = 0; chi < 256; chi++) {
-        chAcc += chHist[chi];
-        if (chAcc >= chNeed) { chMed = chi; break; }
+      if (chN > 0) {
+        for (var chi = 0; chi < 256; chi++) {
+          chAcc += chHist[chi];
+          if (chAcc > chNeed) { chMed = chi; break; }
+        }
       }
       chromaFloor = Math.max(34, chMed * 1.6);
     }
@@ -1516,8 +1557,9 @@
       var trow = hr * hw, row = y * w;
       for (var x = 0; x < w; x++) {
         var i0 = xi0[x], i1 = xi1[x], xw2 = xwt[x];
-        var t0 = thM[trow + i0], t1 = thM[trow + i1];
-        var th = t0 + (t1 - t0) * xw2;
+        // modified：临时阈值改名，与计时起点彻底解耦，避免 var 提升造成二次遮蔽。
+        var tv0 = thM[trow + i0], tv1 = thM[trow + i1];
+        var th = tv0 + (tv1 - tv0) * xw2;
         var ti = th < 0 ? 0 : (th > 255 ? 255 : th | 0);
         var a = (th - floor0 - gray[row + x]) * INV[ti];
         a = a < 0 ? 0 : (a > 1 ? 1 : a);
@@ -1671,7 +1713,9 @@
     res.stats = {
       inkRatio: inkCount / n,
       skew: skew,
-      ms: now() - t0,
+      // modified：计时起点原叫 t0，与阈值插值循环里的 var t0 是同一个函数作用域变量，
+      // 被覆盖后 now()-t0 减的是最后一个阈值像素，实测漂白模式 stats.ms = -127.9。
+      ms: now() - tStart,
       msDeskew: tDeskew,
       edgeCut: edgeCut,
       edgeBlobs: edgeBlobs
@@ -1682,11 +1726,14 @@
   }
 
   var API = {
+    // modified：2.4.6 — 全量复审：修正印章掩膜跨字节形态学、无损回读三态、
+    // 下采样污染输入、计时变量遮蔽、色度中位数小样本、导出写回失败处理、
+    // 清空竞态与静态服务边界；自检扩展到 pdfout 层（19 项）。
     // modified：2.4.5 — 界面参数自动记忆（localStorage），刷新/重启后沿用上次设定。
     // modified：2.4.4 — 输出长边上限跟随"处理分辨"，修复三档体积几乎无差别。
     // modified：2.4.3 — 导出文件名与源文件一致、可写回源文件覆盖、导出后自动清空工作栏。
     // modified：2.4.2 — 复审修复彩色候选基准（泛黄纸整页判墨）、无损校验长度判定与公共设施问题。
-    version: '2.4.5',
+    version: '2.4.6',
     defaults: DEFAULTS,
     presets: PRESETS,
     process: process,

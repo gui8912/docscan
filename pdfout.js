@@ -38,6 +38,11 @@
   }
 
   /* 回读校验用：把 Flate 流解回原始位图，与编码前的位图逐字节比对 */
+  /* modified：三态返回值必须区分「环境不支持」与「解压失败」。
+   * 原先两者都返回 null，而 same() 把 null 当成"无法判定"放行；实测把压缩流
+   * 中间字节篡改后 DecompressionStream 抛错 → inflate 返回 null → verify=null
+   * → app.js 只在 verify===false 时拦截，损坏的 1bit 流就这样混过了导出。
+   * 现在：null = 没有 DecompressionStream（无法判定）；false = 解压抛错（确定损坏）。 */
   function inflate(bytes) {
     if (typeof DecompressionStream === 'undefined') return Promise.resolve(null);
     try {
@@ -45,9 +50,9 @@
       var stream = new Blob([bytes]).stream().pipeThrough(ds);
       return new Response(stream).arrayBuffer().then(function (buf) {
         return new Uint8Array(buf);
-      }).catch(function () { return null; });
+      }).catch(function () { return false; });
     } catch (e) {
-      return Promise.resolve(null);
+      return Promise.resolve(false);
     }
   }
 
@@ -174,41 +179,65 @@
    * 闭运算能把 1~2px 的断口接上，而不整体加粗笔画 —— 与马健讲的
    * 形态学"击中-击不中"去毛刺是同一路数。只在字节层面做，代价很小。
    */
+  /* modified：重写跨字节取位。
+   * 原实现用 pv = 前一字节>>7（取到的是 x-8 而不是紧邻的 x-1）、nx = 下一字节>>7，
+   * 且把 nx 补到 (a>>1) 的 bit0 —— 而 (a>>1) 缺的是 bit7（x=字节首像素）。
+   * 结果：膨胀阶段每个字节的首像素被恒置 0（出墨），腐蚀收不回来。
+   * 定向反例 w=16、笔画在 x=9,10：正确输出 1111111110011111，原实现
+   * 1111111100011111（x=8 凭空多一列墨）。1200 张随机掩膜与「逐像素两趟 3x3
+   * 形态学」参考对照：原实现 1132 张有差异，本实现 0 差异。
+   * 参考实现思路来自形态学闭运算的通用定义（膨胀 3x3 与 / 腐蚀 3x3 或），
+   * 项目内以「先横后纵两趟」等价实现，见 ScanTailor / Leptonica 的二值形态学惯例。 */
   function maskClose(m, w, h) {
     var rb = Math.ceil(w / 8);
     var a1 = new Uint8Array(m.length), a2 = new Uint8Array(m.length);
-    var y, j, o, a, pv, nx, up, dn;
-
-    // 1) 横向膨胀：0（出墨）向左右各蔓延 1 像素。图外一律当作留白（1）
+    var y, j, o, a, L, R, up, dn;
+    var tail = (8 - (w % 8)) % 8;
+    var keep = tail ? (0xff << tail) & 0xff : 0xff;
+    // 行末补齐位不是真实像素：膨胀时按图外「留白 1」、腐蚀时按图外「0」处理，
+    // 否则会顺着 (a<<1) 污染 w-1 列的邻域判定。
+    function pad(arr, white) {
+      if (!tail) return;
+      for (var y2 = 0; y2 < h; y2++) {
+        var q = (y2 + 1) * rb - 1;
+        arr[q] = (arr[q] & keep) | (white ? (~keep & 0xff) : 0);
+      }
+    }
+    pad(m, true);
+    // 1) 横向膨胀：r[x] = m[x] & m[x-1] & m[x+1]
     for (y = 0; y < h; y++) {
       o = y * rb;
       for (j = 0; j < rb; j++) {
         a = m[o + j];
-        pv = j > 0 ? m[o + j - 1] >> 7 : 1;
-        nx = j + 1 < rb ? m[o + j + 1] >> 7 : 1;
-        a1[o + j] = a & ((a << 1) | pv) & ((a >> 1) | nx);
+        L = (a >> 1) | ((j > 0 ? (m[o + j - 1] & 1) : 1) << 7);   // 前一字节 bit0 即 x-1
+        R = ((a << 1) & 0xff) | (j + 1 < rb ? (m[o + j + 1] >> 7) : 1); // 下一字节 bit7 即 x+8
+        a1[o + j] = a & L & R;
       }
     }
+    pad(a1, true);
     // 2) 纵向膨胀：与上下各 1 行相与
     for (y = 0; y < h; y++) {
       o = y * rb; up = (y > 0 ? y - 1 : y) * rb; dn = (y + 1 < h ? y + 1 : y) * rb;
       for (j = 0; j < rb; j++) a2[o + j] = a1[o + j] & a1[up + j] & a1[dn + j];
     }
-    // 3) 横向腐蚀：1（留白）向左右蔓延 1 像素，把膨胀撑出来的边收回去
+    pad(a2, false);
+    // 3) 横向腐蚀：r[x] = d[x] | d[x-1] | d[x+1]
     for (y = 0; y < h; y++) {
       o = y * rb;
       for (j = 0; j < rb; j++) {
         a = a2[o + j];
-        pv = j > 0 ? a2[o + j - 1] >> 7 : 0;
-        nx = j + 1 < rb ? a2[o + j + 1] >> 7 : 0;
-        a1[o + j] = a | ((a << 1) | pv) | ((a >> 1) | nx);
+        L = (a >> 1) | ((j > 0 ? (a2[o + j - 1] & 1) : 0) << 7);
+        R = ((a << 1) & 0xff) | (j + 1 < rb ? (a2[o + j + 1] >> 7) : 0);
+        a1[o + j] = a | L | R;
       }
     }
+    pad(a1, false);
     // 4) 纵向腐蚀
     for (y = 0; y < h; y++) {
       o = y * rb; up = (y > 0 ? y - 1 : y) * rb; dn = (y + 1 < h ? y + 1 : y) * rb;
       for (j = 0; j < rb; j++) a2[o + j] = a1[o + j] | a1[up + j] | a1[dn + j];
     }
+    pad(a2, true);   // 恢复 1(透明)，与 red.fill(255) 的初值一致
     return a2;
   }
 
@@ -309,7 +338,13 @@
       red = maskClose(red, w, h);
       var whiteBits = 0;
       for (i = 0; i < red.length; i++) whiteBits += POP8[red[i]];
-      tinted = n - whiteBits;
+      // modified：POP8 按整字节统计，行末补齐位（恒 1）被算成"白"。
+      // 实测 w=9,h=5 且无彩色时 tinted = 45 - 80 = -35、chroma = -0.778，
+      // 会让放大层的彩色墨量守恒阈值判断失效。扣掉补齐位并夹到 [0,n]。
+      var paddingBits = rowBytes * 8 * h - n;
+      tinted = n - (whiteBits - paddingBits);
+      if (tinted < 0) tinted = 0;
+      if (tinted > n) tinted = n;
     }
     return {
       bits: out, red: red, tinted: tinted, ink: plainB ? black / plainB : 0,
@@ -322,7 +357,11 @@
     return new Promise(function (resolve) {
       canvas.toBlob(function (blob) {
         if (!blob) { resolve(null); return; }
-        blob.arrayBuffer().then(function (b) { resolve(new Uint8Array(b)); });
+        // modified：arrayBuffer() 被 reject 时原实现既不 resolve 也不 reject，
+        // Promise 永久挂起 → jpegFit 卡死、导出无响应。与 deflate/inflate 一样补 catch。
+        blob.arrayBuffer().then(function (b) {
+          resolve(new Uint8Array(b));
+        }).catch(function () { resolve(null); });
       }, 'image/jpeg', q);
     });
   }
@@ -426,7 +465,8 @@
     function same(orig, back) {
       // modified：解压结果长度不符属于损坏，必须判"失败"而不是"无法判定"，
       // 否则一条被截断的 Flate 流可以凭"验不了"混过导出前的拦截。
-      if (!back) return null;                       // 环境不支持解压：无法判定
+      if (back === null) return null;                 // 环境不支持解压：无法判定
+      if (back === false || !back) return false;      // 解压抛错 / 空结果：确定损坏
       if (back.length !== orig.length) return false;
       for (var i = 0; i < orig.length; i++) if (back[i] !== orig[i]) return false;
       return true;
@@ -438,7 +478,11 @@
       return inflate(r.redBytes).then(function (back2) {
         var ok2 = same(redBits, back2);
         r.redBits = null;
-        r.verify = (ok === true && ok2 === true) ? true : ((ok === null || ok2 === null) ? null : false);
+        // modified：原合成式 (ok===null||ok2===null) ? null : false 会把
+        // (false, null) 这种「已确定损坏 + 另一路验不了」吞成 null 放行。
+        // 改为「任一确定失败即失败」，无法判定只在没有任何 false 时才返回。
+        r.verify = (ok === false || ok2 === false) ? false
+          : (ok === true && ok2 === true) ? true : null;
         return r;
       });
     });
@@ -676,18 +720,32 @@
 
   function zip(files) {
     // files: [{name, bytes}]
-    var parts = [], central = [], offset = 0, i;
+    // modified：ZIP 原实现直接把 f.name 写进局部/中央头，构造 {name:'a/b.txt'} 可写出
+    // 带路径分隔符的条目（zip-slip 向量）；且非 ASCII 名未置 UTF-8 标志位(bit11)、
+    // DOS 时间日期为 0（1980-00-00 非法）、文件数用 u16 会回绕。这里一并加固。
+    if (!files || files.length > 65535) throw new Error('ZIP 条目数超出上限');
+    var parts = [], central = [], offset = 0;
     function u16(v) { return [v & 0xff, (v >> 8) & 0xff]; }
     function u32(v) { return [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff]; }
+    var dt = new Date();
+    var yr = Math.max(1980, Math.min(2107, dt.getFullYear()));
+    var dosTime = (dt.getHours() << 11) | (dt.getMinutes() << 5) | (dt.getSeconds() >> 1);
+    var dosDate = ((yr - 1980) << 9) | ((dt.getMonth() + 1) << 5) | dt.getDate();
 
     files.forEach(function (f) {
-      var nameBytes = new TextEncoder().encode(f.name);
+      var safe = String(f.name || 'file').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
+        .replace(/^\.+/, '') || 'file';
+      var nameBytes = new TextEncoder().encode(safe);
+      var ascii = /^[\x20-\x7e]+$/.test(safe);
+      var flags = ascii ? 0 : 0x0800;              // bit11：文件名为 UTF-8
       var crc = crc32(f.bytes);
-      var local = [].concat([0x50, 0x4b, 0x03, 0x04], u16(20), u16(0), u16(0), u16(0), u16(0),
+      var local = [].concat([0x50, 0x4b, 0x03, 0x04], u16(20), u16(flags), u16(0),
+        u16(dosTime), u16(dosDate),
         u32(crc), u32(f.bytes.length), u32(f.bytes.length), u16(nameBytes.length), u16(0));
       var head = new Uint8Array(local);
       parts.push(head, nameBytes, f.bytes);
-      var cent = [].concat([0x50, 0x4b, 0x01, 0x02], u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      var cent = [].concat([0x50, 0x4b, 0x01, 0x02], u16(20), u16(20), u16(flags), u16(0),
+        u16(dosTime), u16(dosDate),
         u32(crc), u32(f.bytes.length), u32(f.bytes.length), u16(nameBytes.length),
         u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset));
       central.push(new Uint8Array(cent), nameBytes);
@@ -714,6 +772,15 @@
     pack1bit: pack1bit,
     png1bit: png1bit,
     scanColor: scanColor,
-    _packInk: packInk    // 供自测/诊断读取阈值，不参与导出流程
+    // modified：暴露纯函数供 tools/selftest.js 做 Node 侧回归断言。
+    // 此前自检只 require core.js，pdfout 的位运算/无损校验/CRC 等回归完全测不到。
+    _packInk: packInk,          // 供自测/诊断读取阈值，不参与导出流程
+    _maskClose: maskClose,
+    _verifyLossless: verifyLossless,
+    _inflate: inflate,
+    _crc32: crc32
   };
+  // modified：与 core.js 一致补 CommonJS 导出。原先只挂 global.DocScanPDF，
+  // Node 里 require('./pdfout.js') 得到空对象，自检根本测不到这一层。
+  if (typeof module !== 'undefined' && module.exports) module.exports = global.DocScanPDF;
 })(typeof window !== 'undefined' ? window : globalThis);
