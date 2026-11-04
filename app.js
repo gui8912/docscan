@@ -177,7 +177,7 @@
   var PERSIST_IDS = [
     'whitening', 'textDark', 'shadow', 'contrast', 'denoise', 'sharpen',
     'keepColor', 'autoQuad', 'trimEdge', 'edgeClean', 'splitSpread', 'deskew',
-    'inkGrow', 'trim',
+    'inkGrow', 'inkGrowMode', 'trim',
     'presetSel', 'resSel', 'budgetSel', 'pageSizeSel'
   ];
 
@@ -333,7 +333,10 @@
       denoise: +$('denoise').value,
       sharpen: +$('sharpen').value,
       keepColor: $('keepColor').checked,
-      inkGrow: $('inkGrow').checked ? 1 : 0,
+      // modified：2.4.7 — 断笔接续档位：1 公文·仿宋 | 2 增强 | 3 旧版弱墨补偿。
+      // 老存档里没有 inkGrowMode 这个键，+$('...').value 仍取得到 HTML 的 selected 默认 1，
+      // 且 core.js 对 undefined/NaN 也回落到 1，双重兜底，不会出现「开了却没生效」。
+      inkGrow: $('inkGrow').checked ? (+$('inkGrowMode').value || 1) : 0,
       deskew: $('deskew').checked ? 'auto' : 'off',
       trim: $('trim').checked,
       trimEdge: $('trimEdge').checked,
@@ -1278,7 +1281,8 @@
     };
 
     // 开关（deskew / inkGrow 原先漏绑，切换后不重算）
-    ['keepColor', 'trim', 'trimEdge', 'edgeClean', 'deskew', 'inkGrow'].forEach(function (id) {
+    // modified：2.4.7 — 档位下拉同样要触发重算，否则改档位后预览仍是旧结果。
+    ['keepColor', 'trim', 'trimEdge', 'edgeClean', 'deskew', 'inkGrow', 'inkGrowMode'].forEach(function (id) {
       $(id).onchange = queueReprocess;
     });
     $('autoQuad').onchange = function () {

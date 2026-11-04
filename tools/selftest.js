@@ -324,6 +324,149 @@ check('损坏的 Flate 流必须判 verify=false（导出拦截依据）', funct
     .then(function (out) { assert(out.verify === false, 'verify = ' + out.verify + '，损坏流会被放行'); });
 });
 
+/* ================= 2.4.7 新增：方向性断笔桥接回归断言 =================
+ * 全部基于独立的 alpha 平面手工构造，不复用被测代码里的任何游程逻辑。
+ * 锁住：纯白断口真的被接上、四方向各接一次、软过渡、字间距不误接、
+ * 不整体加粗、方向之间不连锁扩张、added 不重复、档位端到端可跑。 */
+var BG = DocScan._internals.bridgeGaps;
+var ESW = DocScan._internals.estimateStrokeWidth;
+var BCFG = { solid: 0.65, minRun: 2, maxGap: 2 };
+
+function plane(w, h) { return new Float32Array(w * h); }
+function hRun(a, w, y, x0, x1, v) { for (var x = x0; x <= x1; x++) a[y * w + x] = v; }
+function vRun(a, w, x, y0, y1, v) { for (var y = y0; y <= y1; y++) a[y * w + x] = v; }
+function dRun(a, w, x, y, dx, dy, n, v) {
+  for (var i = 0; i < n; i++) a[(y + i * dy) * w + (x + i * dx)] = v;
+}
+
+check('断笔接续：水平 2px 纯白断口被接上，且补的是软过渡而非实心方棍', function () {
+  var w = 16, h = 9, a = plane(w, h);
+  hRun(a, w, 4, 2, 4, 1); hRun(a, w, 4, 7, 9, 1);
+  var add = BG(a, w, h, BCFG);
+  assert(add.length >= 2, '纯白断口未被处理（旧版缺陷）');
+  assert(a[4 * w + 5] > 0.6 && a[4 * w + 6] > 0.6, '断口补墨不足：' + a[4 * w + 5] + ',' + a[4 * w + 6]);
+  assert(a[4 * w + 5] < 1 && a[4 * w + 6] < 1, '补成了实心，失去软过渡');
+});
+
+check('断笔接续：垂直 1px 断口被接上', function () {
+  var w = 16, h = 12, a = plane(w, h);
+  vRun(a, w, 8, 2, 4, 1); vRun(a, w, 8, 6, 8, 1);
+  BG(a, w, h, BCFG);
+  assert(a[5 * w + 8] > 0.6, '竖向断口未接：' + a[5 * w + 8]);
+});
+
+check('断笔接续：+45° / -45° 斜向断口（撇捺）都被接上', function () {
+  var w = 14, h = 14, c = plane(w, h), d = plane(w, h);
+  dRun(c, w, 2, 2, 1, 1, 3, 1); dRun(c, w, 6, 6, 1, 1, 3, 1);
+  BG(c, w, h, BCFG);
+  assert(c[5 * w + 5] > 0.6, '+45° 断口未接：' + c[5 * w + 5]);
+  dRun(d, w, 2, 11, 1, -1, 3, 1); dRun(d, w, 6, 7, 1, -1, 3, 1);
+  BG(d, w, h, BCFG);
+  assert(d[8 * w + 5] > 0.6, '-45° 断口未接：' + d[8 * w + 5]);
+});
+
+check('断笔接续：4px 字间距不被误接成断口', function () {
+  var w = 18, h = 9, a = plane(w, h);
+  hRun(a, w, 4, 2, 4, 1); hRun(a, w, 4, 9, 11, 1);
+  BG(a, w, h, BCFG);
+  for (var x = 5; x <= 8; x++) assert(a[4 * w + x] === 0, 'x=' + x + ' 被误补：' + a[4 * w + x]);
+});
+
+check('断笔接续：孤立 1px 噪点不构成端点，不补', function () {
+  var w = 14, h = 9, a = plane(w, h);
+  a[4 * w + 2] = 1; hRun(a, w, 4, 4, 6, 1);
+  BG(a, w, h, BCFG);
+  assert(a[4 * w + 3] === 0, '噪点被当成笔画端点：' + a[4 * w + 3]);
+});
+
+check('断笔接续：只改断口内的像素，笔画本身不加粗、方向间不连锁扩张', function () {
+  var w = 18, h = 12, a = plane(w, h), y, x, i;
+  for (y = 3; y <= 5; y++) { hRun(a, w, y, 2, 4, 1); hRun(a, w, y, 7, 9, 1); }
+  var before = a.slice();   // 快照必须在构造笔画之后取
+  BG(a, w, h, BCFG);
+  var changed = 0;
+  for (i = 0; i < a.length; i++) {
+    if (a[i] === before[i]) continue;
+    changed++;
+    x = i % w; y = (i / w) | 0;
+    assert(x >= 5 && x <= 6 && y >= 3 && y <= 5,
+      '断口外的像素被改动（连锁扩张）：x=' + x + ',y=' + y + ',v=' + a[i]);
+    assert(a[i] > 0.6 && a[i] < 1, '补墨量异常：' + a[i]);
+  }
+  assert(changed === 6, '改动像素数应为 3 行 × 2 列 = 6，实际 ' + changed);
+});
+
+check('断笔接续：笔画宽度由水平游程中位数估计，粗细两档可区分', function () {
+  var w = 40, h = 30, thin = plane(w, h), thick = plane(w, h);
+  for (var y = 0; y < h; y++) { hRun(thin, w, y, 2, 3, 1); hRun(thick, w, y, 2, 6, 1); }
+  assert(ESW(thin, w, h, 0.65) === 2, '细笔画宽度应为 2，实际 ' + ESW(thin, w, h, 0.65));
+  assert(ESW(thick, w, h, 0.65) === 5, '粗笔画宽度应为 5，实际 ' + ESW(thick, w, h, 0.65));
+  assert(ESW(plane(2, 2), 2, 2, 0.65) === 0, '样本不足时应返回 0 让调用方走保守档');
+});
+
+check('断笔接续：added 索引不重复，横竖共补同一像素时取最大值不累加', function () {
+  var w = 16, h = 16, a = plane(w, h);
+  hRun(a, w, 8, 5, 7, 1); hRun(a, w, 8, 9, 11, 1);
+  vRun(a, w, 8, 5, 7, 1); vRun(a, w, 8, 9, 11, 1);
+  var add = BG(a, w, h, BCFG), seen = {};
+  for (var i = 0; i < add.length; i++) {
+    assert(!seen[add[i]], 'added 出现重复索引 ' + add[i] + '（会被墨量曲线处理两次）');
+    seen[add[i]] = 1;
+  }
+  assert(a[8 * w + 8] > 0.6 && a[8 * w + 8] < 1,
+    '交叉断口补墨应取最大而非累加：' + a[8 * w + 8]);
+});
+
+check('断笔接续：三个档位端到端均可运行，默认关闭时不改变输出', function () {
+  var w = 120, h = 150, src = blank(w, h, [255, 255, 255]);
+  for (var y = 30; y <= 110; y += 16) fill(src, w, 20, y, 100, y + 3, [30, 30, 30]);
+  var off = run(src.slice(), w, h, { mode: 'bleach' });
+  var on1 = run(src.slice(), w, h, { mode: 'bleach', inkGrow: 1 });
+  var on2 = run(src.slice(), w, h, { mode: 'bleach', inkGrow: 2 });
+  var on3 = run(src.slice(), w, h, { mode: 'bleach', inkGrow: 3 });
+  [off, on1, on2, on3].forEach(function (r, k) {
+    assert(r.data.length === w * h * 4, '档位 ' + k + ' 输出尺寸异常');
+    assert(isFinite(r.stats.inkRatio) && r.stats.inkRatio >= 0 && r.stats.inkRatio <= 1,
+      '档位 ' + k + ' 墨量非法：' + r.stats.inkRatio);
+  });
+  var off0 = run(src.slice(), w, h, { mode: 'bleach', inkGrow: 0 });
+  for (var i = 0; i < off.data.length; i++) {
+    assert(off.data[i] === off0.data[i], '默认与显式关闭结果不一致，位置 ' + i);
+  }
+  var white = 0;
+  for (i = 0; i < on1.data.length; i += 4) if (on1.data[i] > 200) white++;
+  assert(white > w * h * 0.6, '开启桥接后整页被判墨，白像素仅 ' + white);
+});
+
+check('断笔接续：默认档必须接上 2px 断口（旧版档与关闭档都接不上）', function () {
+  var w = 200, h = 120, src = blank(w, h, [255, 255, 255]), holes = [], y, yy, k, p;
+  for (y = 20; y <= 80; y += 30) {
+    fill(src, w, 20, y, 180, y + 6, [10, 10, 10]);
+    for (k = 0; k < 2; k++) {
+      for (yy = y; yy < y + 6; yy++) {
+        p = (yy * w + 98 + k) * 4;
+        src[p] = src[p + 1] = src[p + 2] = 255;
+        holes.push(yy * w + 98 + k);
+      }
+    }
+  }
+  function nBlack(d) {
+    var n = 0;
+    for (var i = 0; i < holes.length; i++) {
+      var q = holes[i] * 4;
+      if (0.299 * d[q] + 0.587 * d[q + 1] + 0.114 * d[q + 2] < 150) n++;
+    }
+    return n;
+  }
+  var off = run(src.slice(), w, h, { mode: 'bleach', inkGrow: 0 });
+  var on = run(src.slice(), w, h, { mode: 'bleach', inkGrow: 1 });
+  var legacy = run(src.slice(), w, h, { mode: 'bleach', inkGrow: 3 });
+  assert(nBlack(off.data) <= 1, '关闭档不应补断口，实际补了 ' + nBlack(off.data));
+  assert(nBlack(legacy.data) <= 1, '旧版档本就接不上纯白断口（根因证据），实际 ' + nBlack(legacy.data));
+  assert(nBlack(on.data) >= holes.length * 0.8,
+    '默认档 2px 断口接通率过低：' + nBlack(on.data) + '/' + holes.length);
+});
+
 Promise.all(pending).then(function () {
   console.log('\n通过 ' + passed + ' 项，失败 ' + failed + ' 项' +
     (skipped ? '，跳过 ' + skipped + ' 项（当前 Node 缺 DecompressionStream）' : '') + '\n');

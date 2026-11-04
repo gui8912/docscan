@@ -37,7 +37,7 @@
     sharpen: 0.35,       // 锐化 0 - 1
     keepColor: true,     // 保留红头 / 印章
     colorBoost: 1.0,     // 彩色浓度 0.6 - 1.6
-    inkGrow: 0,          // 细笔画保护 0 关 | 1 轻度 | 2 中度
+    inkGrow: 0,          // 断笔接续 0 关 | 1 公文·仿宋 | 2 增强 | 3 旧版弱墨补偿
     deskew: 'auto',      // auto 自动 | off 关闭 | force 强制
     maxDim: 2000,        // 输出最长边
     trim: false,         // 裁白边（按墨迹外框）
@@ -874,6 +874,138 @@
     return alpha;
   }
 
+  /* ============================================================
+   * 断笔接续（2.4.7 新增）：方向性条件桥接
+   * ------------------------------------------------------------
+   * 旧 4.2 段只遍历 inkIdx（alpha>0.02 的墨迹像素），纯白断口根本不在表里；
+   * 3x3 全向 maxFilter 又把笔画末端朝四面一起拉粗。结果是"名为接续、实为提亮
+   * 淡墨"，断口没接上、字却变粗（README 原本就注明了这一副作用）。
+   *
+   * 借鉴的公开方案：
+   *   - 线形结构元闭运算 strel('line', L, θ)：中文横排取 0°/90°，撇捺取 ±45°，
+   *     比 3x3 方形核更少糊住笔画交叉处（MATLAB/OpenCV 文档二值化常规做法）。
+   *   - 笔刷算法：按 1D 游程桥接相邻笔画，而不是全局膨胀（《自然场景下基于
+   *     连通域检测的文字识别算法研究》）。
+   *   - 骨架端点方向配对 + B 样条插值重建：先判走势、再补笔画（汉字细化文献、
+   *     K-P 算法用 PCA 判断断点是否该连），避免把字间距当断口。
+   *   - CN122113840B：形态学核大小随"平均笔画宽度 / 渲染分辨率"动态调整。
+   *     本实现用水平实心游程的中位数估计笔画宽度：常规 2px 上限；
+   *     只有笔画芯部真的只剩 1px 的极小字才降到 1px，避免把相邻字接上。
+   *     注意「仿宋笔画细」不等于「分辨率低」，不能用笔画细来压断口上限
+   *     （实机回归两次踩过这个坑，见 4.2 段的记录）。
+   *   - Leptonica binary morphology 的边界约定：图外一律视为 OFF（留白），
+   *     所以每条扫描线都在图像边界处自然终止，不会从边界"借"墨进来。
+   *
+   * 与档案保真的边界：这里补的是"扫描/二值化造成的 1~2px 断口"，不是造新笔画；
+   * 上限远小于中文字间距，且默认关闭。真正决定笔画圆润的是灰度中间调与
+   * 放大后二值化（见 pdfout.js encode1bit），本函数不磨圆仿宋的斜势棱角与尖峰。
+   * ============================================================ */
+
+  /** 用水平实心游程的中位数估计主笔画宽度；样本太少返回 0（调用方退回保守档）。 */
+  function estimateStrokeWidth(alpha, w, h, solidThr) {
+    var hist = new Int32Array(13), total = 0, x, y, run, s, acc, L;
+    for (y = 0; y < h; y++) {
+      var row = y * w;
+      run = 0;
+      for (x = 0; x <= w; x++) {
+        s = x < w && alpha[row + x] >= solidThr;
+        if (s) run++;
+        else {
+          if (run > 0 && run <= 12) { hist[run]++; total++; }
+          run = 0;
+        }
+      }
+    }
+    if (total < 24) return 0;
+    acc = 0;
+    for (L = 1; L <= 12; L++) {
+      acc += hist[L];
+      if (acc * 2 >= total) return L;
+    }
+    return 0;
+  }
+
+  /**
+   * 沿一条扫描线找「实心游程 → 短断口 → 实心游程」并补一段软过渡墨。
+   * 补的 alpha 两端略强、中间略弱，1bit 阈值后呈细腰而不是一根方棍；
+   * 多方向补到同一像素时只取最大值，不累加，避免交叉处异常变黑。
+   */
+  function bridgeLine(alpha, solid, line, len, cfg, touched, added, runS, runE) {
+    var t = 0, rn = 0, q, g, idx, val, fall, base, gap, lE, rS, mid;
+    while (t < len) {
+      while (t < len && !solid[line[t]]) t++;
+      if (t >= len) break;
+      runS[rn] = t;
+      while (t < len && solid[line[t]]) t++;
+      runE[rn] = t;
+      rn++;
+    }
+    for (q = 0; q + 1 < rn; q++) {
+      if (runE[q] - runS[q] < cfg.minRun || runE[q + 1] - runS[q + 1] < cfg.minRun) continue;
+      lE = runE[q]; rS = runS[q + 1]; gap = rS - lE;
+      if (gap < 1 || gap > cfg.maxGap) continue;
+      base = Math.min(alpha[line[lE - 1]], alpha[line[rS]]);
+      mid = (gap + 1) / 2;
+      for (g = 0; g < gap; g++) {
+        idx = line[lE + g];
+        // 已经有一定墨量的像素允许被抬高，但不覆盖原始实心笔画
+        if (solid[idx]) continue;
+        fall = 0.94 - 0.14 * Math.abs((g + 1) - mid) / mid;
+        val = Math.max(0.6, Math.min(base * fall, 0.95));
+        if (val > base) val = base;   // 桥接处不应比两端笔画芯部更黑
+        if (alpha[idx] < val) alpha[idx] = val;
+        if (!touched[idx]) { touched[idx] = 1; added.push(idx); }
+      }
+    }
+  }
+
+  /**
+   * 四方向（0° / 90° / +45° / -45°）条件桥接。
+   * @return 新增（被补过墨）的像素索引数组，调用方需并入 inkIdx。
+   */
+  function bridgeGaps(alpha, w, h, cfg) {
+    var n = w * h;
+    var maxLen = Math.max(w, h);
+    var line = new Int32Array(maxLen);
+    var runS = new Int32Array((maxLen >> 1) + 2);
+    var runE = new Int32Array((maxLen >> 1) + 2);
+    // modified：实心判据必须冻结在「补墨之前」的原始快照上。若四条方向边改边判，
+    // 水平方向补出的 0.89 会被垂直方向当成新端点，继续往外补，形成连锁扩张、把字变粗。
+    var solid = new Uint8Array(n);
+    for (var si = 0; si < n; si++) solid[si] = alpha[si] >= cfg.solid ? 1 : 0;
+    var touched = new Uint8Array(n);
+    var added = [];
+    var x, y, startY, startX;
+
+    // 0° 水平
+    for (y = 0; y < h; y++) {
+      var row = y * w;
+      for (x = 0; x < w; x++) line[x] = row + x;
+      bridgeLine(alpha, solid, line, w, cfg, touched, added, runS, runE);
+    }
+    // 90° 垂直
+    for (x = 0; x < w; x++) {
+      for (y = 0; y < h; y++) line[y] = y * w + x;
+      bridgeLine(alpha, solid, line, h, cfg, touched, added, runS, runE);
+    }
+    // +45°（右下）：起点在第一行与第一列
+    for (startX = 0; startX < w; startX++) { lineDiag(0, startX, 1, 1, w, h); }
+    for (startY = 1; startY < h; startY++) { lineDiag(startY, 0, 1, 1, w, h); }
+    // -45°（右上）：起点在第一列与最后一行；方向 (1,-1) 才是与 +45° 正交的一族
+    for (startY = 0; startY < h; startY++) { lineDiag(startY, 0, 1, -1, w, h); }
+    for (startX = 1; startX < w; startX++) { lineDiag(h - 1, startX, 1, -1, w, h); }
+
+    function lineDiag(sy, sx, stepX, stepY, W, H) {
+      var len2 = 0, px = sx, py = sy;
+      while (px >= 0 && px < W && py >= 0 && py < H) {
+        line[len2++] = py * W + px;
+        px += stepX; py += stepY;
+      }
+      if (len2 >= 2) bridgeLine(alpha, solid, line, len2, cfg, touched, added, runS, runE);
+    }
+    return added;
+  }
+
   function inkBBox(alpha, w, h) {
     var minX = w, minY = h, maxX = -1, maxY = -1;
     for (var y = 0; y < h; y++) {
@@ -1622,13 +1754,45 @@
       alpha = removeSpecks(alpha, w, h, o.denoise >= 2 ? 14 : 6, inkIdx, inkN);
     }
 
-    /* --- 4.2 断笔接续：紧邻实心笔画的弱墨像素被拉起来 ---
-     * 只作用于 alpha 的邻域关系，不做全局膨胀，因此不会把 2px 笔画撑成 4px。 */
+    /* --- 4.2 断笔接续（2.4.7 重写：方向性条件桥接） ---
+     * 旧版只遍历 inkIdx（alpha>0.02 的墨迹像素），纯白断口不在表里，等于没接；
+     * 3x3 全向 maxFilter 还把笔画末端朝四面一起拉粗。现改为按 0°/90°/±45°
+     * 四条方向线找「实心 ≥2px → 短断口 → 实心 ≥2px」，只在留白像素上补软过渡墨。
+     * 档位：1 公文·仿宋（默认，断口 1~2px）| 2 增强（更低实心门槛、断口 +1px）
+     *       | 3 旧版弱墨补偿（保留 2.4.6 行为，供对比/回退）。
+     * 详细出处与保真边界见 bridgeGaps 上方的注释。 */
     if (o.inkGrow > 0) {
-      var mx3 = maxFilter(alpha, w, h, o.inkGrow);
-      for (var q2 = 0; q2 < inkN; q2++) {
-        var iq = inkIdx[q2], aq = alpha[iq];
-        if (aq < 0.55 && mx3[iq] > 0.72) alpha[iq] = aq + (mx3[iq] - aq) * 0.42;
+      var growMode = (o.inkGrow === 3 || o.inkGrow === '3') ? 3 : (o.inkGrow >= 2 ? 2 : 1);
+      if (growMode === 3) {
+        var mxOld = maxFilter(alpha, w, h, 1);
+        for (var qo = 0; qo < inkN; qo++) {
+          var io = inkIdx[qo], ao = alpha[io];
+          // modified 2.4.7：补 ao>0.02，避免 removeSpecks 已清零的噪点被邻域最大值复活
+          // （审计报告 3.4「断笔接续 inkIdx 未重建，噪点可能被复活」即出于此）。
+          if (ao > 0.02 && ao < 0.55 && mxOld[io] > 0.72) alpha[io] = ao + (mxOld[io] - ao) * 0.42;
+        }
+      } else {
+        var solidThr = growMode === 2 ? 0.56 : 0.65;
+        var strokeW = estimateStrokeWidth(alpha, w, h, solidThr);
+        // modified：2.4.7 实机回归（仿宋 46px 样本、442 个 2px 断口）两次纠偏：
+        // ① 「sw>=4 才允许 2px」过严，只接上 11/442；
+        // ② 改用「sw<=2 就降到 1px」仍是 11/442 —— 仿宋笔画本来就纤细
+        //    （46px 字笔画宽约 2px），「笔画细」不等于「分辨率低」，不能拿它压上限。
+        // 结论：常规固定 2px（300dpi 仿宋字间距 ≥8px，2px 很安全），
+        // 只有笔画芯部真的只剩 1px 的极小字才降到 1px；增强档 3px。
+        var gapMax = (strokeW === 1) ? 1 : 2;
+        if (growMode === 2) gapMax = Math.min(3, gapMax + 1);
+        var addedInk = bridgeGaps(alpha, w, h, { solid: solidThr, minRun: 2, maxGap: gapMax });
+        // 新补像素必须并入 inkIdx，否则后面的墨量曲线与合成不会处理它们；
+        // 旧索引里已被 removeSpecks 清零的项由后续循环的 av<=0 跳过，不会被复活。
+        for (var ab = 0; ab < addedInk.length; ab++) {
+          if (inkN >= inkIdx.length) {
+            var cap2 = new Int32Array(inkIdx.length * 2);
+            cap2.set(inkIdx);
+            inkIdx = cap2;
+          }
+          inkIdx[inkN++] = addedInk[ab];
+        }
       }
     }
 
@@ -1726,6 +1890,9 @@
   }
 
   var API = {
+    // modified：2.4.7 — 断笔接续重写为「方向性条件桥接」：四方向游程判走势、
+    // 笔画宽度自适应断口上限、软过渡补墨；修复纯白断口从未被接续、全向膨胀
+    // 拉粗笔画、噪点复活三处旧问题；新增档位与旧档回退。
     // modified：2.4.6 — 全量复审：修正印章掩膜跨字节形态学、无损回读三态、
     // 下采样污染输入、计时变量遮蔽、色度中位数小样本、导出写回失败处理、
     // 清空竞态与静态服务边界；自检扩展到 pdfout 层（19 项）。
@@ -1733,7 +1900,7 @@
     // modified：2.4.4 — 输出长边上限跟随"处理分辨"，修复三档体积几乎无差别。
     // modified：2.4.3 — 导出文件名与源文件一致、可写回源文件覆盖、导出后自动清空工作栏。
     // modified：2.4.2 — 复审修复彩色候选基准（泛黄纸整页判墨）、无损校验长度判定与公共设施问题。
-    version: '2.4.6',
+    version: '2.4.7',
     defaults: DEFAULTS,
     presets: PRESETS,
     process: process,
@@ -1753,6 +1920,8 @@
       boxBlur: boxBlur,
       sauvolaMap: sauvolaMap,
       removeSpecks: removeSpecks,
+      bridgeGaps: bridgeGaps,
+      estimateStrokeWidth: estimateStrokeWidth,
       classLut: CLASS_LUT,
       detectEdgeTrim: detectEdgeTrim,
       paperLevel: paperLevel
