@@ -1,6 +1,6 @@
 {
   "name": "chengwen-docscan",
-  "version": "2.4.7",
+  "version": "2.4.8",
   "private": true,
   "description": "浏览器内运行的扫描件漂白/保色/成册工具，零运行时依赖",
   "keywords": ["scan", "document", "binarization", "pdf", "sauvola"],
@@ -11,6 +11,7 @@
   "scripts": {
     "start": "node serve.js",
     "serve": "node serve.js",
-    "test": "node tools/selftest.js"
+    "test": "node tools/selftest.js",
+    "sync": "node tools/gitsync.js push"
   }
 }

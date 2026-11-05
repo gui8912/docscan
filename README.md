@@ -127,6 +127,24 @@ node tools/selftest.js      # 29 项断言，纯 Node，无浏览器依赖
 4. 导出图片 ZIP：纯黑白页是 1 位 PNG（同一页通常只有几 KB~几十 KB），彩色页是 PNG，灰度页是 JPEG；逐页打开确认内容不重复。
 5. 打开开发者工具控制台，确认没有报错。
 
+## GitHub 同步（2.4.8 起，仅开发用）
+
+本机到 `github.com:443` 时通时不通；环境变量里的代理端口又常失效（`ECONNREFUSED`）或上游返回 `CONNECT 502`，直接 `git push` 会卡几分钟才报错。`tools/gitsync.js` 把选路固化下来：
+
+```bash
+node tools/gitsync.js check   # 只探测，不改任何配置
+node tools/gitsync.js push    # 探测后 push origin main
+node tools/gitsync.js fetch   # 探测后 fetch origin --prune
+node tools/gitsync.js set     # 把实测可用路由写进本仓库 .git/config
+node tools/gitsync.js unset   # 清掉仓库级代理配置
+```
+
+或直接双击 `同步GitHub.bat`（等价 `push`）。
+
+判据不是「端口能连上」，而是**该路由下 `git ls-remote` 真的成功**——只有这一步能排除「CONNECT 200 但上游 502」的假通。脚本零依赖、输出纯 ASCII；调 git 时会剥掉环境里的 `http_proxy` / `https_proxy` 等变量，避免旧代理再插一脚。探测顺序：直连 → 环境变量里的端口 → `10808 / 10809 / 10807 / 50808 / 7890 / 7891 / 1080 / 8889 / 8080 / 20171 / 2080 / 4780`。
+
+笔记本上若直连可用，`check` 直接报 `route = direct`，无需任何配置。
+
 ## 已知限制与风险
 
 以下都是**已知且有意保留**的行为，使用前请对照：
@@ -163,8 +181,10 @@ app.js            交互层：导入、逐页处理、参数快照、导出与�
 demo.js           合成示例（红头文件 + 手机拍摄效果）
 serve.js          零依赖静态服务（仅 127.0.0.1，含路径/隐藏文件/方法校验）
 serve.bat         Windows 一键启动（纯 ASCII + CRLF，优先 node）
+同步GitHub.bat    Windows 一键推送（等价 node tools/gitsync.js push）
 启动本地服务.txt   serve.bat 的中文说明（UTF-8 BOM）
 tools/selftest.js 29 项自检，覆盖内核 + 导出层（node tools/selftest.js）
+tools/gitsync.js  GitHub 通道自检 / 推送（直连与本地代理自动选路，仅开发用）
 vendor/           PDF.js 3.11.174（本地内置，不联网）
 samples/          两份可复现的样例 PDF
 ```
