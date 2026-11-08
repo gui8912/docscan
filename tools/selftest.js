@@ -467,6 +467,86 @@ check('断笔接续：默认档必须接上 2px 断口（旧版档与关闭档�
     '默认档 2px 断口接通率过低：' + nBlack(on.data) + '/' + holes.length);
 });
 
+/* ================= 2.4.9 新增：裁切框与统一裁切 =================
+ * 统一裁切的"数学"在 core.unifyCrop 里，这里可以直接断言；
+ * 页面层（临时画布补白、导出接线）只能靠浏览器回归，见 README 的手动验证清单。 */
+console.log('\n-- 2.4.9 裁切框 / 统一裁切 --');
+
+check('裁白边：关闭时返回整页框，开启时框与裁剪尺寸一致', function () {
+  var w = 120, h = 90, src = blank(w, h, [255, 255, 255]);
+  fill(src, w, 20, 15, 90, 70, [10, 10, 10]);
+
+  var off = run(src.slice(), w, h, { mode: 'bleach', trim: false });
+  assert(off.box && off.box.cut === false, '关闭裁白边时 box.cut 应为 false');
+  assert(off.box.w === w && off.box.h === h, '关闭时应返回整页框，实际 ' + off.box.w + 'x' + off.box.h);
+  assert(off.preW === w && off.preH === h, 'preW/preH 应等于输入尺寸');
+
+  var on = run(src.slice(), w, h, { mode: 'bleach', trim: true });
+  assert(on.box && on.box.cut === true, '开启后应判定为需要裁切');
+  assert(on.w === on.box.w && on.h === on.box.h,
+    '裁后尺寸必须与框一致：' + on.w + 'x' + on.h + ' vs ' + on.box.w + 'x' + on.box.h);
+  assert(on.box.x >= 0 && on.box.y >= 0 && on.box.x + on.box.w <= w && on.box.y + on.box.h <= h,
+    '裁切框越出页面边界');
+  assert(on.box.x <= 20 && on.box.y <= 15 && on.box.x + on.box.w >= 90 && on.box.y + on.box.h >= 70,
+    '裁切框没有覆盖墨迹区域，会切到内容');
+});
+
+check('裁白边：空白页与墨迹铺满整页时不裁', function () {
+  var bl = run(blank(80, 60, [255, 255, 255]), 80, 60, { mode: 'bleach', trim: true });
+  assert(bl.box.cut === false && bl.w === 80 && bl.h === 60, '空白页不应产生裁剪');
+  // 铺满整页时若仍按墨迹框裁，等于把内容切掉一圈，必须拒绝
+  var full = run(blank(80, 60, [10, 10, 10]), 80, 60, { mode: 'bleach', trim: true });
+  assert(full.box.cut === false, '墨迹铺满整页时不应裁切');
+});
+
+check('统一裁切：各页裁成同一尺寸，且框覆盖每页原内容', function () {
+  var items = [
+    { key: 'a', preW: 1000, preH: 1400, box: { x: 100, y: 100, w: 800, h: 1200 } },
+    { key: 'b', preW: 1000, preH: 1400, box: { x: 100, y: 100, w: 800, h: 900 } },   // 末页只有小半页
+    { key: 'c', preW: 1000, preH: 1400, box: { x: 110, y: 100, w: 790, h: 1150 } }
+  ];
+  var u = DocScan.unifyCrop(items, 0.02);
+  assert(!!u, '三页同尺寸应能求出统一框');
+  assert(u.w === 800 && u.h === 1200, '并集应为 800x1200，实际 ' + u.w + 'x' + u.h);
+  ['a', 'b', 'c'].forEach(function (k) {
+    var r = u.rects[k];
+    assert(r && r.w === 800 && r.h === 1200, k + ' 页尺寸未统一');
+    var b = items[k === 'a' ? 0 : (k === 'b' ? 1 : 2)].box;
+    assert(r.x <= b.x && r.y <= b.y && r.x + r.w >= b.x + b.w && r.y + r.h >= b.y + b.h,
+      k + ' 页的统一框没有覆盖原裁切框（会切内容）');
+  });
+});
+
+check('统一裁切：尺寸差 1% 仍归一组，差 20% 退回逐页', function () {
+  var near = [
+    { key: 'a', preW: 1000, preH: 1400, box: { x: 100, y: 100, w: 800, h: 1200 } },
+    { key: 'b', preW: 1010, preH: 1414, box: { x: 101, y: 101, w: 808, h: 1212 } }
+  ];
+  var u = DocScan.unifyCrop(near, 0.02);
+  assert(!!u && u.count === 2, '1% 尺寸差应能统一（开纸张检测后必然有差）');
+  assert(u.rects.a.w === u.rects.b.w && u.rects.a.h === u.rects.b.h, '尺寸差相近的两页仍必须同尺寸');
+
+  var far = [
+    { key: 'a', preW: 1000, preH: 1400, box: { x: 100, y: 100, w: 800, h: 1200 } },
+    { key: 'b', preW: 1600, preH: 2200, box: { x: 100, y: 100, w: 800, h: 1200 } }
+  ];
+  assert(DocScan.unifyCrop(far, 0.02) === null, '尺寸差过大应退回逐页裁，不能硬凑');
+});
+
+check('统一裁切：单页不做统一，框永不越界', function () {
+  assert(DocScan.unifyCrop([{ key: 'a', preW: 800, preH: 1000, box: { x: 0, y: 0, w: 800, h: 1000 } }], 0.02) === null,
+    '单页没有"统一"的意义，应返回 null');
+  var u = DocScan.unifyCrop([
+    { key: 'a', preW: 900, preH: 1200, box: { x: 10, y: 10, w: 880, h: 1180 } },
+    { key: 'b', preW: 900, preH: 1200, box: { x: 0, y: 0, w: 900, h: 1200 } }
+  ], 0.02);
+  assert(!!u && u.w === 900 && u.h === 1200, '并集为整页时目标尺寸应为整页');
+  ['a', 'b'].forEach(function (k) {
+    var r = u.rects[k];
+    assert(r.x >= 0 && r.y >= 0 && r.x + r.w <= 900 && r.y + r.h <= 1200, k + ' 页统一框越界');
+  });
+});
+
 Promise.all(pending).then(function () {
   console.log('\n通过 ' + passed + ' 项，失败 ' + failed + ' 项' +
     (skipped ? '，跳过 ' + skipped + ' 项（当前 Node 缺 DecompressionStream）' : '') + '\n');

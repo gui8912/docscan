@@ -177,7 +177,7 @@
   var PERSIST_IDS = [
     'whitening', 'textDark', 'shadow', 'contrast', 'denoise', 'sharpen',
     'keepColor', 'autoQuad', 'trimEdge', 'edgeClean', 'splitSpread', 'deskew',
-    'inkGrow', 'inkGrowMode', 'trim',
+    'inkGrow', 'inkGrowMode', 'trimSel',
     'presetSel', 'resSel', 'budgetSel', 'pageSizeSel'
   ];
 
@@ -218,6 +218,10 @@
     var o;
     try { o = JSON.parse(raw); } catch (e) { return false; }
     if (!o || typeof o !== 'object') return false;
+
+    // modified：2.4.9 — 老存档里「裁去白边」是布尔 trim；现在是三档下拉 trimSel。
+    // 不做迁移的话，升级后这一项会被静默丢弃（用户会以为"我的设置怎么没了"）。
+    if (!('trimSel' in o) && typeof o.trim === 'boolean') o.trimSel = o.trim ? '1' : '0';
 
     for (var i = 0; i < PERSIST_IDS.length; i++) {
       var id = PERSIST_IDS[i], el = $(id);
@@ -323,6 +327,8 @@
   /* ---------------- 状态读取 ---------------- */
 
   function readOpts() {
+    // modified：2.4.9 — 控件缺失时回落到"不裁"，避免旧缓存页面直接抛异常。
+    var trimMode = $('trimSel') ? (+$('trimSel').value || 0) : 0;
     return {
       mode: S.mode,
       preset: $('presetSel') ? $('presetSel').value : 'standard',
@@ -338,7 +344,11 @@
       // 且 core.js 对 undefined/NaN 也回落到 1，双重兜底，不会出现「开了却没生效」。
       inkGrow: $('inkGrow').checked ? (+$('inkGrowMode').value || 1) : 0,
       deskew: $('deskew').checked ? 'auto' : 'off',
-      trim: $('trim').checked,
+      // modified：2.4.9 — 裁白边分三档：0 不裁 | 1 逐页裁 | 2 统一裁（全篇同尺寸）。
+      // trimMode 会存进每页的参数快照：统一裁切只认"按统一档处理过"的页，
+      // 否则拿一页没裁的整页框去求并集，会把所有页都撑成整页。
+      trim: trimMode > 0,
+      trimMode: trimMode,
       trimEdge: $('trimEdge').checked,
       edgeClean: $('edgeClean').checked ? 1 : 0,
       maxDim: S.res
@@ -361,6 +371,11 @@
       result: null,
       rawWarp: null,
       enc: null,
+      // modified：2.4.9 — 裁切框（裁前坐标）与统一裁切临时画布缓存。
+      box: null,
+      preW: 0,
+      preH: 0,
+      _uc: null,
       // modified：保存每页参数快照与任务序号，避免全局参数和异步旧任务污染导出。
       options: null,
       // modified：记录源文件句柄（File System Access API）。导出时可写回原路径，
@@ -555,12 +570,94 @@
 
   /* ---------------- 处理 ---------------- */
 
+  /* ---------------- 统一裁切（2.4.9） ----------------
+   * 痛点：公文每页内容长短不同（末页往往只有几行），逐页按墨迹外框裁，
+   * 每页裁出来的像素尺寸都不一样 —— 导出的 PDF 在阅读器里翻页会"忽大忽小"，
+   * 打印装订时版心也对不齐。
+   * 做法：各页先照常算出自己的裁切框，再由这里求一个全篇共用的框，
+   * 让每页都裁成同一个像素尺寸（不做重采样，只平移裁切窗口）。
+   * 借鉴 ScanTailor 的 "page size / match size with other pages" 与
+   * unpaper 的边界处理：宁可多留一圈白，也不切到版心内容。 */
+  var unifyBox = null;
+
+  /** 求全篇统一裁切框。返回 null 表示不做统一（档位不是"统一"或有效页不足 2 页）。 */
+  function computeUnifyBox(pages) {
+    unifyBox = null;
+    var sel = $('trimSel');
+    if (!sel || (+sel.value || 0) !== 2) return null;
+
+    var cand = [];
+    for (var i = 0; i < pages.length; i++) {
+      var p = pages[i];
+      if (!p || !p.result || !p.box || !p.preW || !p.preH) continue;
+      // 只认"按统一档处理过"的页：参数没应用到的页若拿整页框参与并集，
+      // 会把全篇撑成整页大小，统一裁切就白做了。
+      if (!p.options || p.options.trimMode !== 2) continue;
+      cand.push(p);
+    }
+    // modified：2.4.9 — 并集、容差、夹边这些数学搬进 core.js 的 unifyCrop()，
+    // 一是能进 Node 自检（页面逻辑测不到），二是 UI 层只管收集数据。
+    var u = DocScan.unifyCrop(cand.map(function (p) {
+      return { key: p.id, preW: p.preW, preH: p.preH, box: p.box };
+    }), 0.015);
+    if (!u) return null;
+    // 没按统一档处理过的页：不参与并集，但要在导出时提示用户补齐参数
+    u.outliers = pages.length - cand.length;
+    unifyBox = u;
+    return u;
+  }
+
+  /** 统一裁切的两种"没做成"要明确告诉用户，否则只会觉得功能没生效。 */
+  function unifyHint(u) {
+    if (u) {
+      if (u.outliers > 0) {
+        toast('统一裁切：有 ' + u.outliers + ' 页未按统一档处理，尺寸可能与其余页不同；可点「应用参数到全部页」补齐', 'error');
+      }
+      return;
+    }
+    var sel = $('trimSel');
+    if (S.pages.length > 1 && sel && (+sel.value || 0) === 2) {
+      toast('统一裁切未生效：各页处理尺寸差异过大（常见于开着「检测纸张边缘」时被裁成内容框），可关掉后重试', 'error');
+    }
+  }
+
+  /** 取统一裁切框里的纸色，用于补齐"被裁掉的那圈白边"。 */
+  function paperFill(canvas) {
+    try {
+      var d = canvas.getContext('2d').getImageData(0, 0, 1, 1).data;
+      return 'rgb(' + d[0] + ',' + d[1] + ',' + d[2] + ')';
+    } catch (e) {
+      return '#fff';
+    }
+  }
+
+  /** 某页最终用于编码/预览的画布：统一裁切生效时返回按统一框裁好的画布。 */
+  function pageCanvas(p) {
+    if (!p || !p.result) return null;
+    if (!unifyBox || !p.box) return p.result;
+    var r = unifyBox.rects[p.id];
+    if (!r) return p.result;
+    if (r.x === p.box.x && r.y === p.box.y && r.w === p.box.w && r.h === p.box.h) return p.result;
+    var key = r.x + ',' + r.y + ',' + r.w + ',' + r.h;
+    if (p._uc && p._uc.key === key && p._uc.src === p.result) return p._uc.cv;
+    var cv = document.createElement('canvas');
+    cv.width = r.w; cv.height = r.h;
+    var cx = cv.getContext('2d');
+    // 并集框可能比本页已裁区域大：越界的那部分本来就是纸边，用纸色补回去，
+    // 而不是留透明/黑色（1bit 导出会把透明当黑）。
+    cx.fillStyle = paperFill(p.result);
+    cx.fillRect(0, 0, r.w, r.h);
+    cx.drawImage(p.result, p.box.x - r.x, p.box.y - r.y);
+    p._uc = { key: key, src: p.result, cv: cv };
+    return cv;
+  }
+
   // modified：统一编码入口，以结果画布、每页参数和预算作为缓存键，并阻止校验失败页导出。
   async function encodeForPage(p) {
     if (!p || !p.result) throw new Error('页面尚未处理完成');
     if (p.status === 'error') throw new Error('页面最近一次处理失败，请重新处理后再导出');
     var opts = p.options || readOpts();
-    var source = p.result;
+    var source = pageCanvas(p);
     var mode = opts.mode, keepColor = opts.keepColor;
     // modified：输出长边上限跟随"处理分辨"，不再让编码器兜底到 3508。
     // 原先这里不传 maxSide，pdfout 恒取 3508，于是用户选 2000/2600 时处理阶段
@@ -577,7 +674,9 @@
       if (enc.red && !enc.redBytes) throw new Error('彩色掩膜编码失败，已阻止导出');
       enc._source = source;
       enc._budget = S.budget; enc._mode = mode; enc._kc = keepColor; enc._maxSide = maxSide;
-      if (p.result !== source) return encodeForPage(p);
+      // modified：2.4.9 — 编码源可能来自统一裁切的临时画布，这里要按"重新取一次"比较，
+      // 不能再拿 p.result 比（那会永远不相等 → 无限递归）。
+      if (pageCanvas(p) !== source) return encodeForPage(p);
       p.enc = enc;
     }
     return enc;
@@ -620,6 +719,12 @@
       if (run !== p._run) return;
       p.rawWarp = toCanvas(warp);
       p.result = toCanvas(res);
+      // modified：2.4.9 — 记下裁切框与裁前尺寸，供"统一裁切"求全篇并集；
+      // 换了结果画布，统一裁切的临时画布缓存必须作废。
+      p.box = res.box || null;
+      p.preW = res.preW || res.w;
+      p.preH = res.preH || res.h;
+      p._uc = null;
       p.options = opts;
       p.meta = { srcW: img.width, srcH: img.height, outW: res.w, outH: res.h, ms: 0, ink: res.stats.inkRatio, edgeCut: res.stats.edgeCut, edgeBlobs: res.stats.edgeBlobs };
       await encodeForPage(p);
@@ -659,7 +764,8 @@
     $('pgName').textContent = p.name;
 
     var showSource = S.adjust;
-    var img = showSource ? rotatedSource(p) : (p.result || rotatedSource(p));
+    // modified：2.4.9 — 预览走 pageCanvas，统一裁切后看到的框就是导出的框。
+    var img = showSource ? rotatedSource(p) : (pageCanvas(p) || rotatedSource(p));
     var cv = $('cvFinal');
     if (cv.width !== img.width || cv.height !== img.height) {
       cv.width = img.width; cv.height = img.height;
@@ -710,7 +816,10 @@
     layoutStage();
 
     if (p.meta) {
-      $('sbSize').textContent = p.meta.outW + ' × ' + p.meta.outH + ' px';
+      // modified：2.4.9 — 统一裁切后实际画布尺寸与处理尺寸不同，按真实画布显示，
+      // 并标明该页是否参与了统一裁切（没参与的页尺寸会和其他页不一样，要能一眼看出）。
+      $('sbSize').textContent = img.width + ' × ' + img.height + ' px' +
+        (unifyBox && unifyBox.rects[p.id] ? ' · 统一裁切' : '');
       $('sbTime').textContent = '· ' + Math.round(p.meta.ms) + ' ms';
       var note = [];
       var ec = p.meta.edgeCut;
@@ -838,6 +947,33 @@
     }, 260);
   }
 
+  /** 把当前参数应用到全部页（按钮与「统一裁」切换共用）。 */
+  async function applyAllPages() {
+    // modified：忙时禁止重入，避免两轮批处理共用单一布尔 busy 提前解锁。
+    if (S.busy) { toast('正在处理，请稍候'); return; }
+    if (!S.pages.length) return;
+    // modified：整批只取一次参数，批处理途中拖滑杆不会让前后页参数不一致。
+    var snap = readOpts();
+    busy(true, '正在应用参数…');
+    for (var i = 0; i < S.pages.length; i++) {
+      busy(true, '应用参数 ' + (i + 1) + ' / ' + S.pages.length + '…');
+      await processPage(S.pages[i], snap);
+      renderRail();
+    }
+    // 全篇参数一致后立刻重算统一框，预览与状态栏才对得上
+    computeUnifyBox(S.pages);
+    // modified：2.4.9 — 统一框是在各页编码之后才算出来的，此时旧编码尺寸已经过期
+    // （三页仍显示各自的高度）。整批作废，当前页立即重编码以便状态栏如实显示。
+    for (var j = 0; j < S.pages.length; j++) S.pages[j].enc = null;
+    var cur = current();
+    if (cur && cur.result) {
+      try { await encodeForPage(cur); } catch (e) { console.error(e); }
+    }
+    busy(false);
+    render();
+    updateStats();
+  }
+
   function syncLabels() {
     $('vWhitening').textContent = (+$('whitening').value).toFixed(2);
     $('vTextDark').textContent = (+$('textDark').value).toFixed(2);
@@ -956,9 +1092,13 @@
     // 这里给每页递增代次（processPage 用 p._run 判定过期），并清掉待触发的定时器。
     clearTimeout(applyTimer);
     applyTimer = null;
+    // modified：2.4.9 — 统一裁切框与逐页临时画布一并作废，否则残留的并集框
+    // 会套到下一批完全无关的页面上。
+    unifyBox = null;
     S.pages.forEach(function (p) {
       p._run = (p._run || 0) + 1;
       p.src = null; p.result = null; p.rawWarp = null; p.enc = null;
+      p.box = null; p.preW = 0; p.preH = 0; p._uc = null;
       p._rotCv = null; p._thumbSrc = null; p._thumbUrl = null; p.srcHandle = null;
     });
     S.pages = [];
@@ -1008,6 +1148,18 @@
     busy(true, '正在压缩并排版 PDF…');
     try {
       var items = [];
+      // modified：2.4.9 — 先把整批页处理完，再求统一裁切框。
+      // 统一框必须看全篇墨迹范围，处理一页导一页的话，后面的页会把框撑大，
+      // 前面已编码的页就与最终框不一致了。
+      for (var q0 = 0; q0 < S.pages.length; q0++) {
+        if (!S.pages[q0].result) {
+          busy(true, '正在处理第 ' + (q0 + 1) + ' / ' + S.pages.length + ' 页…');
+          await tick(1);
+          await processPage(S.pages[q0]);
+        }
+      }
+      var ub = computeUnifyBox(S.pages);
+      unifyHint(ub);
       for (var i = 0; i < S.pages.length; i++) {
         var p = S.pages[i];
         busy(true, '正在压缩第 ' + (i + 1) + ' / ' + S.pages.length + ' 页…');
@@ -1091,27 +1243,38 @@
       // 漂白页始终用 PNG；连续调页用 JPEG。多色漂白页也必须用 24 位 PNG。
       var files = [];
       var keptColor = 0, pngCount = 0, jpgCount = 0;
+      // modified：2.4.9 — 与 PDF 导出一致：先处理完整批页，再定统一裁切框。
+      for (var q0 = 0; q0 < S.pages.length; q0++) {
+        if (!S.pages[q0].result) {
+          busy(true, '正在处理第 ' + (q0 + 1) + ' / ' + S.pages.length + ' 页…');
+          await tick(1);
+          await processPage(S.pages[q0]);
+        }
+      }
+      unifyHint(computeUnifyBox(S.pages));
       for (var i = 0; i < S.pages.length; i++) {
         var p = S.pages[i];
         if (!p.result) await processPage(p);
         var enc = await encodeForPage(p);
+        // 图片导出同样走统一裁切后的画布，否则 ZIP 里各页尺寸又会不一致。
+        var pv = pageCanvas(p) || p.result;
         var opts = p.options || readOpts();
         var continuous = opts.mode === 'gray' || opts.mode === 'color';
         var colorScan = null;
         var hasColor = opts.mode === 'bleach' && opts.keepColor &&
-          (enc.red || (enc.type === 'jpeg' && !!(colorScan = DocScanPDF.scanColor(p.result))));
+          (enc.red || (enc.type === 'jpeg' && !!(colorScan = DocScanPDF.scanColor(pv))));
         var ext = continuous ? 'jpg' : 'png';
         // var 在循环间共享绑定，必须显式清空，否则后续页会复用第一张图的字节。
         var bytes = null, blob = null;
         if (continuous) {
-          blob = await new Promise(function (res) { p.result.toBlob(res, 'image/jpeg', 0.92); });
+          blob = await new Promise(function (res) { pv.toBlob(res, 'image/jpeg', 0.92); });
         } else if (hasColor) {
           // 单色掩膜与多色回退都不能塞进 1 位 PNG，否则颜色会被静默删掉。
-          blob = await new Promise(function (res) { p.result.toBlob(res, 'image/png'); });
+          blob = await new Promise(function (res) { pv.toBlob(res, 'image/png'); });
           keptColor++;
         } else {
-          bytes = await DocScanPDF.png1bit(p.result);
-          if (!bytes) blob = await new Promise(function (res) { p.result.toBlob(res, 'image/png'); });
+          bytes = await DocScanPDF.png1bit(pv);
+          if (!bytes) blob = await new Promise(function (res) { pv.toBlob(res, 'image/png'); });
         }
         if (!bytes) {
           if (!blob) throw new Error('第 ' + (i + 1) + ' 页图片编码失败');
@@ -1282,9 +1445,15 @@
 
     // 开关（deskew / inkGrow 原先漏绑，切换后不重算）
     // modified：2.4.7 — 档位下拉同样要触发重算，否则改档位后预览仍是旧结果。
-    ['keepColor', 'trim', 'trimEdge', 'edgeClean', 'deskew', 'inkGrow', 'inkGrowMode'].forEach(function (id) {
+    ['keepColor', 'trimEdge', 'edgeClean', 'deskew', 'inkGrow', 'inkGrowMode'].forEach(function (id) {
       $(id).onchange = queueReprocess;
     });
+    // modified：2.4.9 — 选「统一裁」时必须整批重算：只有当前页带统一档快照的话，
+    // 其余页不会参与并集，导出尺寸依然不一致（用户会以为功能没生效）。
+    $('trimSel').onchange = function () {
+      if (this.value === '2' && S.pages.length > 1) { applyAllPages(); return; }
+      queueReprocess();
+    };
     $('autoQuad').onchange = function () {
       var p = current();
       if (p) { p.quadManual = false; if (!this.checked) p.quad = null; }
@@ -1322,22 +1491,7 @@
       if (document.visibilityState === 'hidden') flushSettings();
     });
 
-    $('btnApplyAll').onclick = async function () {
-      // modified：忙时禁止重入，避免两轮批处理共用单一布尔 busy 提前解锁。
-      if (S.busy) { toast('正在处理，请稍候'); return; }
-      if (!S.pages.length) return;
-      // modified：整批只取一次参数，批处理途中拖滑杆不会让前后页参数不一致。
-      var snap = readOpts();
-      busy(true, '正在应用参数…');
-      for (var i = 0; i < S.pages.length; i++) {
-        busy(true, '应用参数 ' + (i + 1) + ' / ' + S.pages.length + '…');
-        await processPage(S.pages[i], snap);
-        renderRail();
-      }
-      busy(false);
-      render();
-      updateStats();
-    };
+    $('btnApplyAll').onclick = function () { applyAllPages(); };
 
     // 工具条
     $('btnAdjust').onclick = function () {
@@ -1364,6 +1518,13 @@
       p.quad = null; p.quadManual = false; p._rot = -1;
       busy(true, '旋转并重新处理…');
       await processPage(p);
+      // modified：2.4.9 — 旋转后本页的宽高可能翻转，统一裁切框必须跟着重算，
+      // 否则预览仍按旧框（宽高互换）裁，画面会错位。重算后当前页重编码以对齐状态栏。
+      if ($('trimSel') && (+$('trimSel').value || 0) === 2) {
+        computeUnifyBox(S.pages);
+        p.enc = null;
+        try { await encodeForPage(p); } catch (e) { console.error(e); }
+      }
       busy(false);
       renderRail(); render();
     };

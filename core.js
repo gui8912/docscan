@@ -1052,15 +1052,101 @@
     return out;
   }
 
-  // modified：连续调与漂白共享同一裁白边入口和留白规则。
-  function trimInk(res, alpha, w, h, enabled) {
-    if (!enabled) return res;
+  // modified：2.4.9 — 裁白边改为「先算框、再按框裁」，框随结果返回，
+  // 上层据此可以做「统一裁切」：全篇共用一个框 → 各页输出尺寸一致、版心对齐。
+  // 返回 {x,y,w,h,cut}；cut=false 表示无需裁（禁用 / 空白页 / 墨迹几乎铺满整页）。
+  function trimBox(alpha, w, h, enabled) {
+    var full = { x: 0, y: 0, w: w, h: h, cut: false };
+    if (!enabled) return full;
     var bb = inkBBox(alpha, w, h);
-    if (!bb || (bb.w >= w * 0.98 && bb.h >= h * 0.98)) return res;
+    if (!bb) return full;
+    // 墨迹几乎铺满整页时不能裁：此时的「白边」其实是内容，裁下去会切到字。
+    if (bb.w >= w * 0.98 && bb.h >= h * 0.98) return full;
     var pad = Math.round(Math.min(w, h) * 0.012);
     var x0 = Math.max(0, bb.x - pad), y0 = Math.max(0, bb.y - pad);
     var x1 = Math.min(w, bb.x + bb.w + pad), y1 = Math.min(h, bb.y + bb.h + pad);
-    return crop(res, x0, y0, x1 - x0, y1 - y0);
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0, cut: true };
+  }
+
+  // modified：连续调与漂白共享同一裁白边入口和留白规则。
+  // box / preW / preH 一定挂在返回值上（即使没裁），否则调用方无法把「已裁画布」
+  // 放回整页坐标系，统一裁切时会算错偏移。
+  function trimInk(res, alpha, w, h, enabled) {
+    var b = trimBox(alpha, w, h, enabled);
+    res.box = b;
+    res.preW = w;
+    res.preH = h;
+    if (!b.cut) return res;
+    var out = crop(res, b.x, b.y, b.w, b.h);
+    out.box = b;
+    out.preW = w;
+    out.preH = h;
+    return out;
+  }
+
+  /* modified：2.4.9 — 全篇统一裁切框（纯函数，便于 Node 自检直接覆盖）。
+   * items: [{ key, preW, preH, box:{x,y,w,h} }]（key 由调用方给，通常是页 id）
+   * 返回 { w, h, rects:{key:{x,y,w,h}}, count, skipped } 或 null（有效页不足 2 页）。
+   *
+   * 规则：
+   *  ① 取 preW 居中的那页为基准，个别被裁歪的页带不偏基准；
+   *  ② 只收与基准尺寸差 ≤ tol 的页 —— 开了「检测纸张边缘」时，透视校正后
+   *     每页尺寸本来就会差几像素，卡死"完全相等"会让功能形同虚设。
+   *     容差默认 1.5%（小于墨迹外框自带的 1.2% 留白余量）：超出这个比例，
+   *     被夹小的那一圈就会啃到正文，而不是只啃白边。
+   *  ③ 并集用相对坐标求：各页像素尺寸不同，直接比像素会整体错位；
+   *  ④ 目标尺寸夹到组内最小页，保证每页都真能裁出来 —— 宁可多切几条空白边，
+   *     也不能裁出一个本页没有的区域（那会切掉正文）。
+   * 不做重采样：各页裁成同一像素尺寸，只是把窗口平移/对齐。 */
+  function unifyCrop(items, tol) {
+    var list = [], i;
+    for (i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (!it || !it.box || !(it.preW > 0) || !(it.preH > 0)) continue;
+      list.push(it);
+    }
+    if (list.length < 2) return null;
+
+    var t = tol > 0 ? tol : 0.015;
+    var sorted = list.slice().sort(function (a, b) { return a.preW - b.preW; });
+    var ref = sorted[sorted.length >> 1];
+    var refW = ref.preW, refH = ref.preH;
+
+    var group = [];
+    for (i = 0; i < list.length; i++) {
+      var p = list[i];
+      if (Math.abs(p.preW - refW) <= refW * t && Math.abs(p.preH - refH) <= refH * t) group.push(p);
+    }
+    if (group.length < 2) return null;
+
+    var rx0 = 1, ry0 = 1, rx1 = 0, ry1 = 0, minW = Infinity, minH = Infinity;
+    for (i = 0; i < group.length; i++) {
+      var q = group[i];
+      var bx0 = q.box.x / q.preW, by0 = q.box.y / q.preH;
+      var bx1 = (q.box.x + q.box.w) / q.preW, by1 = (q.box.y + q.box.h) / q.preH;
+      if (bx0 < rx0) rx0 = bx0;
+      if (by0 < ry0) ry0 = by0;
+      if (bx1 > rx1) rx1 = bx1;
+      if (by1 > ry1) ry1 = by1;
+      if (q.preW < minW) minW = q.preW;
+      if (q.preH < minH) minH = q.preH;
+    }
+
+    var tw = Math.min(minW, Math.max(1, Math.round((rx1 - rx0) * refW)));
+    var th = Math.min(minH, Math.max(1, Math.round((ry1 - ry0) * refH)));
+    var cxr = (rx0 + rx1) / 2, cyr = (ry0 + ry1) / 2;
+
+    var rects = {};
+    for (i = 0; i < group.length; i++) {
+      var pg = group[i];
+      // 以并集中心对齐，再夹回本页内：各页内容在最终页面里的相对位置才一致
+      var x = Math.round(cxr * pg.preW - tw / 2);
+      var y = Math.round(cyr * pg.preH - th / 2);
+      x = Math.max(0, Math.min(pg.preW - tw, x));
+      y = Math.max(0, Math.min(pg.preH - th, y));
+      rects[pg.key] = { x: x, y: y, w: tw, h: th };
+    }
+    return { w: tw, h: th, rects: rects, count: group.length, skipped: list.length - group.length };
   }
 
   // modified：灰度/彩色使用独立连续调流水线，不再进入 Sauvola 二值化。
@@ -1523,7 +1609,11 @@
     if (!(sw > 0 && sh > 0) || !srcData || srcData.length < sw * sh * 4) {
       var empty = new Uint8ClampedArray(4);
       empty[0] = empty[1] = empty[2] = empty[3] = 255;
-      return { data: empty, w: 1, h: 1, stats: { inkRatio: 0, skew: 0, ms: 0, msDeskew: 0, edgeCut: 0, edgeBlobs: 0 } };
+      return {
+        data: empty, w: 1, h: 1,
+        box: { x: 0, y: 0, w: 1, h: 1, cut: false }, preW: 1, preH: 1,
+        stats: { inkRatio: 0, skew: 0, ms: 0, msDeskew: 0, edgeCut: 0, edgeBlobs: 0 }
+      };
     }
     var tStart = now();
     var tDeskew = 0, skew = 0;
@@ -1890,6 +1980,8 @@
   }
 
   var API = {
+    // modified：2.4.9 — 裁白边改为「先算框再裁」，结果多带 box/preW/preH，
+    // 支持全篇统一裁切（各页同尺寸、版心对齐）；运行参数与二值化算法未改。
     // modified：2.4.8 — 仅开发辅助：新增 tools/gitsync.js 与 同步GitHub.bat 解决
     // 本机 github.com 时通时不通（直连被墙 / 环境代理端口失效 / CONNECT 502）
     // 导致 push 卡死；运行时算法未改，浏览器侧无行为变化。
@@ -1903,7 +1995,7 @@
     // modified：2.4.4 — 输出长边上限跟随"处理分辨"，修复三档体积几乎无差别。
     // modified：2.4.3 — 导出文件名与源文件一致、可写回源文件覆盖、导出后自动清空工作栏。
     // modified：2.4.2 — 复审修复彩色候选基准（泛黄纸整页判墨）、无损校验长度判定与公共设施问题。
-    version: '2.4.8',
+    version: '2.4.9',
     defaults: DEFAULTS,
     presets: PRESETS,
     process: process,
@@ -1917,6 +2009,8 @@
     detectSpread: detectSpread,
     splitRes: splitRes,
     reframe: reframe,
+    // modified：2.4.9 — 全篇统一裁切框（输入各页裁前尺寸与裁切框，输出共用框）
+    unifyCrop: unifyCrop,
     // 供基准测试 / 单元测试
     _internals: {
       estimateBackground: estimateBackground,
@@ -1927,7 +2021,9 @@
       estimateStrokeWidth: estimateStrokeWidth,
       classLut: CLASS_LUT,
       detectEdgeTrim: detectEdgeTrim,
-      paperLevel: paperLevel
+      paperLevel: paperLevel,
+      inkBBox: inkBBox,
+      trimBox: trimBox
     }
   };
 
