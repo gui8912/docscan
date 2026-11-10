@@ -27,6 +27,11 @@
     pageSize: 'a4',
     busy: false,
     pendingApply: false,
+    // modified：2.4.10 — 全篇识别范围（相对坐标）与框选编辑态。
+    // 任务级设定：不写 localStorage，刷新 / 清空任务自动失效，
+    // 免得下次导入版心不同的文件被旧框静默切掉正文。
+    roi: null,
+    roiMode: false,
     uuid: 1
   };
 
@@ -351,7 +356,9 @@
       trimMode: trimMode,
       trimEdge: $('trimEdge').checked,
       edgeClean: $('edgeClean').checked ? 1 : 0,
-      maxDim: S.res
+      maxDim: S.res,
+      // modified：2.4.10 — 识别范围随参数快照走，整批应用时各页用同一份框。
+      roi: S.roi ? { x: S.roi.x, y: S.roi.y, w: S.roi.w, h: S.roi.h } : null
     };
   }
 
@@ -369,7 +376,10 @@
       quad: null,
       quadManual: false,
       result: null,
+      // fullWarp：未套识别范围的整页校正图，框选模式以它为底图。
+      fullWarp: null,
       rawWarp: null,
+      roiRect: null,
       enc: null,
       // modified：2.4.9 — 裁切框（裁前坐标）与统一裁切临时画布缓存。
       box: null,
@@ -715,9 +725,16 @@
       }
       await tick(1);
 
-      var res = DocScan.process(warp.data, warp.w, warp.h, opts);
+      // modified：2.4.10 — 识别范围在四角校正之后、任何识别 / 增强之前生效。
+      // fullWarp 保留未裁整页供框选；rawWarp 按同一框裁，对比层才不会与结果错位。
+      // 框外像素是「物理移除」：不进入背景估计、Sauvola 阈值、墨量统计与自动裁白边。
+      p.fullWarp = toCanvas(warp);
+      var cr = DocScan.cropROI(warp.data, warp.w, warp.h, opts.roi);
+      p.roiRect = cr.rect;
+      var rWarp = cr.cut ? { data: cr.data, w: cr.w, h: cr.h } : warp;
+      var res = DocScan.process(rWarp.data, rWarp.w, rWarp.h, opts);
       if (run !== p._run) return;
-      p.rawWarp = toCanvas(warp);
+      p.rawWarp = toCanvas(rWarp);
       p.result = toCanvas(res);
       // modified：2.4.9 — 记下裁切框与裁前尺寸，供"统一裁切"求全篇并集；
       // 换了结果画布，统一裁切的临时画布缓存必须作废。
@@ -746,6 +763,8 @@
 
   function render() {
     var p = current();
+    $('btnRoi').classList.toggle('on', S.roiMode);
+    $('btnRoi').textContent = S.roiMode ? '完成框选' : '识别范围';
     var empty = $('empty'), wrap = $('pageWrap');
     document.body.classList.toggle('nopage', !p);
     if (!p) {
@@ -763,9 +782,8 @@
     $('pgIdx').textContent = (S.cur + 1) + ' / ' + S.pages.length;
     $('pgName').textContent = p.name;
 
-    var showSource = S.adjust;
-    // modified：2.4.9 — 预览走 pageCanvas，统一裁切后看到的框就是导出的框。
-    var img = showSource ? rotatedSource(p) : (pageCanvas(p) || rotatedSource(p));
+    // modified：2.4.10 — 框选模式要看「未裁的整页」，否则框和已裁画布对不上。
+    var img = displayImage(p);
     var cv = $('cvFinal');
     if (cv.width !== img.width || cv.height !== img.height) {
       cv.width = img.width; cv.height = img.height;
@@ -776,7 +794,7 @@
 
     // 对比层
     var raw = $('cvRaw');
-    if (S.compare && p.rawWarp) {
+    if (S.compare && p.rawWarp && !S.roiMode) {
       raw.hidden = false;
       if (raw.width !== cv.width || raw.height !== cv.height) {
         raw.width = cv.width; raw.height = cv.height;
@@ -792,9 +810,9 @@
       $('cmpLine').hidden = true;
     }
 
-    // 调框层
+    // 调框层与识别范围层互斥：两者都要独占画布上的指针事件
     var layer = $('quadLayer');
-    if (S.adjust) {
+    if (S.adjust && !S.roiMode) {
       layer.hidden = false;
       var q = p.quad || insetQuad(img.width, img.height);
       p.quad = q;
@@ -807,10 +825,29 @@
         el.style.left = (q[i].x / iw * 100).toFixed(3) + '%';
         el.style.top = (q[i].y / ih * 100).toFixed(3) + '%';
       });
-      $('stageBadge').hidden = false;
     } else {
       layer.hidden = true;
-      $('stageBadge').hidden = true;
+    }
+    // modified：2.4.10 — 框选模式显示整页 + 识别范围框
+    var roiLayer = $('roiLayer');
+    if (S.roiMode) {
+      roiLayer.hidden = false;
+      renderRoiLayer();
+    } else {
+      roiLayer.hidden = true;
+    }
+    var badge = $('stageBadge');
+    if (S.roiMode) {
+      badge.hidden = false;
+      $('stageBadgeTxt').textContent = '框选识别范围：拖拽画框、拖四角调整，松开即应用到全部页';
+      $('btnRoiClear').hidden = false;
+    } else if (S.adjust) {
+      badge.hidden = false;
+      $('stageBadgeTxt').textContent = '正在调框：拖动四角贴合纸张边缘';
+      $('btnRoiClear').hidden = true;
+    } else {
+      badge.hidden = true;
+      $('btnRoiClear').hidden = true;
     }
 
     layoutStage();
@@ -818,8 +855,13 @@
     if (p.meta) {
       // modified：2.4.9 — 统一裁切后实际画布尺寸与处理尺寸不同，按真实画布显示，
       // 并标明该页是否参与了统一裁切（没参与的页尺寸会和其他页不一样，要能一眼看出）。
-      $('sbSize').textContent = img.width + ' × ' + img.height + ' px' +
-        (unifyBox && unifyBox.rects[p.id] ? ' · 统一裁切' : '');
+      // modified：2.4.10 — 框选模式画面是「未裁整页」，状态栏不能让人误以为那就是
+      // 导出尺寸；这里改报最终输出画布，并把底图尺寸括注出来。
+      $('sbSize').textContent = (S.roiMode && p.result
+        ? '输出 ' + p.result.width + ' × ' + p.result.height + ' px（框选底图 ' + img.width + ' × ' + img.height + '）'
+        : img.width + ' × ' + img.height + ' px') +
+        (unifyBox && unifyBox.rects[p.id] ? ' · 统一裁切' : '') +
+        (S.roi ? ' · 识别范围' : '');
       $('sbTime').textContent = '· ' + Math.round(p.meta.ms) + ' ms';
       var note = [];
       var ec = p.meta.edgeCut;
@@ -852,7 +894,7 @@
     var p = current();
     if (!p) return;
     var wrap = $('pageWrap');
-    var img = S.adjust ? rotatedSource(p) : (p.result || rotatedSource(p));
+    var img = displayImage(p) || rotatedSource(p);
     var vp = $('viewport').getBoundingClientRect();
     var availW = vp.width - 56, availH = vp.height - 56;
     var fit = Math.min(availW / img.width, availH / img.height, 1);
@@ -1002,6 +1044,156 @@
     saveSettings();
   }
 
+  /* ---------------- 识别范围（全篇 ROI） ---------------- */
+
+  /** 预览底图：框选看未裁整页、调框看源图、常态看最终画布。 */
+  function displayImage(p) {
+    if (!p) return null;
+    if (S.roiMode) return p.fullWarp || rotatedSource(p);
+    if (S.adjust) return rotatedSource(p);
+    return pageCanvas(p) || rotatedSource(p);
+  }
+
+  // 拖动中的临时框：松开才提交，避免拖一下就整批重算
+  var roiDraft = null;
+
+  function roiView() {
+    return roiDraft || S.roi || { x: 0.06, y: 0.08, w: 0.88, h: 0.84 };
+  }
+
+  function renderRoiLayer() {
+    var r = roiView();
+    var X = r.x * 100, Y = r.y * 100, W = r.w * 100, H = r.h * 100;
+    function set(id, l, t, w, h) {
+      var e = $(id);
+      e.style.left = l + '%'; e.style.top = t + '%';
+      e.style.width = Math.max(0, w) + '%'; e.style.height = Math.max(0, h) + '%';
+    }
+    set('roiShadeT', 0, 0, 100, Y);
+    set('roiShadeB', 0, Y + H, 100, 100 - Y - H);
+    set('roiShadeL', 0, Y, X, H);
+    set('roiShadeR', X + W, Y, 100 - X - W, H);
+    set('roiBox', X, Y, W, H);
+    var tag = $('roiTag');
+    if (tag) {
+      tag.style.left = 'calc(' + X + '% + 6px)';
+      tag.style.top = 'calc(' + Y + '% + 6px)';
+    }
+    var hs = $('roiLayer').querySelectorAll('.roi-handle');
+    var pts = [[X, Y], [X + W, Y], [X, Y + H], [X + W, Y + H]];
+    Array.prototype.forEach.call(hs, function (el, i) {
+      el.style.left = pts[i][0] + '%'; el.style.top = pts[i][1] + '%';
+    });
+  }
+
+  function updateRoiState() {
+    var e = $('roiState');
+    if (!e) return;
+    if (!S.roi) { e.hidden = true; e.innerHTML = ''; return; }
+    var r = S.roi;
+    e.hidden = false;
+    e.innerHTML = '<b>识别范围</b> 已排除 左 ' + (r.x * 100).toFixed(1) +
+      '% / 上 ' + (r.y * 100).toFixed(1) + '% / 右 ' + ((1 - r.x - r.w) * 100).toFixed(1) +
+      '% / 下 ' + ((1 - r.y - r.h) * 100).toFixed(1) + '%；全篇每页生效，仅本次任务' +
+      '<a id="roiClearLink">清除</a>';
+    var a = $('roiClearLink');
+    if (a) a.onclick = clearROI;
+  }
+
+  /** 松开鼠标后：整批用同一份参数（含 ROI）重处理，全篇一次生效。 */
+  async function commitROI() {
+    if (S.busy) { toast('正在处理，请稍候'); return; }
+    if (!S.pages.length) return;
+    await applyAllPages();
+    toast(S.roi
+      ? '识别范围已应用到全部 ' + S.pages.length + ' 页；框外内容不进入 PDF'
+      : '已清除识别范围，全部页恢复整页');
+  }
+
+  async function clearROI() {
+    S.roi = null; roiDraft = null;
+    updateRoiState();
+    renderRoiLayer();
+    await commitROI();
+  }
+
+  function bindRoiDrag() {
+    var layer = $('roiLayer');
+    var drag = null;
+    function pos(e) {
+      var rect = layer.getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+        y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
+      };
+    }
+    function clampBox(r) {
+      var m = 0.02;
+      var x = Math.max(0, Math.min(1 - m, r.x));
+      var y = Math.max(0, Math.min(1 - m, r.y));
+      var w = Math.max(m, Math.min(1 - x, r.w));
+      var h = Math.max(m, Math.min(1 - y, r.h));
+      return { x: x, y: y, w: w, h: h };
+    }
+    function draft(r) { roiDraft = clampBox(r); renderRoiLayer(); }
+
+    layer.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      var pt = pos(e);
+      var c = e.target && e.target.dataset ? e.target.dataset.c : null;
+      var base = roiView();
+      if (c) drag = { mode: 'corner', c: c, base: base };
+      else if (pt.x >= base.x && pt.x <= base.x + base.w && pt.y >= base.y && pt.y <= base.y + base.h) {
+        drag = { mode: 'move', start: pt, base: base };
+      } else {
+        drag = { mode: 'new', start: pt, base: base };
+      }
+      try { layer.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+
+    layer.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      var pt = pos(e), b = drag.base, r, fx, fy;
+      if (drag.mode === 'new') {
+        r = { x: Math.min(drag.start.x, pt.x), y: Math.min(drag.start.y, pt.y),
+              w: Math.abs(pt.x - drag.start.x), h: Math.abs(pt.y - drag.start.y) };
+      } else if (drag.mode === 'move') {
+        r = { x: Math.max(0, Math.min(1 - b.w, b.x + pt.x - drag.start.x)),
+              y: Math.max(0, Math.min(1 - b.h, b.y + pt.y - drag.start.y)),
+              w: b.w, h: b.h };
+      } else {
+        fx = (drag.c === 'nw' || drag.c === 'sw') ? b.x + b.w : b.x;
+        fy = (drag.c === 'nw' || drag.c === 'ne') ? b.y + b.h : b.y;
+        r = { x: Math.min(fx, pt.x), y: Math.min(fy, pt.y),
+              w: Math.abs(fx - pt.x), h: Math.abs(fy - pt.y) };
+      }
+      draft(r);
+    });
+
+    layer.addEventListener('pointerup', async function (e) {
+      if (!drag) return;
+      var mode = drag.mode;
+      drag = null;
+      try { layer.releasePointerCapture(e.pointerId); } catch (err) {}
+      var v = roiDraft || S.roi;
+      if (mode === 'new' && v && (v.w < 0.03 || v.h < 0.03)) {
+        roiDraft = null;
+        renderRoiLayer();
+        toast('框太小了，请拖出一个矩形', 'error');
+        return;
+      }
+      // 框了整页 = 不启用；normROI 同时夹住越界与非法值
+      S.roi = DocScan.normROI(v);
+      roiDraft = null;
+      updateRoiState();
+      renderRoiLayer();
+      await commitROI();
+    });
+    layer.addEventListener('pointercancel', function () {
+      drag = null; roiDraft = null; renderRoiLayer();
+    });
+  }
+
   /* ---------------- 调框拖拽 ---------------- */
 
   function bindCornerDrag() {
@@ -1097,13 +1289,16 @@
     unifyBox = null;
     S.pages.forEach(function (p) {
       p._run = (p._run || 0) + 1;
-      p.src = null; p.result = null; p.rawWarp = null; p.enc = null;
+      p.src = null; p.result = null; p.rawWarp = null; p.fullWarp = null; p.roiRect = null; p.enc = null;
       p.box = null; p.preW = 0; p.preH = 0; p._uc = null;
       p._rotCv = null; p._thumbSrc = null; p._thumbUrl = null; p.srcHandle = null;
     });
     S.pages = [];
     S.cur = -1;
     S.adjust = false; S.compare = false; S.zoom = 0; S.pendingApply = false;
+    // modified：2.4.10 — 识别范围是「这一份文件」的设定，导出后清空工作栏时一并作废
+    S.roi = null; S.roiMode = false; roiDraft = null;
+    updateRoiState();
     renderRail();
     render();
     updateStats();
@@ -1145,6 +1340,8 @@
   // modified：PDF 导出改用每页编码快照，校验失败时阻止下载。
   async function exportPdf() {
     if (!S.pages.length) { toast('还没有可导出的页面'); return; }
+    // modified：2.4.10 — 框选模式看的是「未裁整页」，导出前退出，避免所见非所得
+    if (S.roiMode) { S.roiMode = false; render(); }
     busy(true, '正在压缩并排版 PDF…');
     try {
       var items = [];
@@ -1237,6 +1434,8 @@
   // modified：按每页实际内容选择 1 位 PNG、彩色 PNG 或 JPEG，并隔离每页字节变量。
   async function exportImages() {
     if (!S.pages.length) { toast('还没有可导出的页面'); return; }
+    // modified：2.4.10 — 同 PDF 导出：退出框选态再取最终画布
+    if (S.roiMode) { S.roiMode = false; render(); }
     busy(true, '正在导出图片…');
     try {
       // 每页按自己的处理快照决定格式，不能用导出时的全局模式重解释旧结果。
@@ -1493,12 +1692,43 @@
 
     $('btnApplyAll').onclick = function () { applyAllPages(); };
 
+    // modified：2.4.10 — 识别范围：进入框选态前确保当前页已有整页校正底图
+    $('btnRoi').onclick = async function () {
+      if (!S.pages.length) { toast('请先导入页面'); return; }
+      S.roiMode = !S.roiMode;
+      if (S.roiMode) {
+        S.adjust = false; S.compare = false;
+        var p = current();
+        // modified：2.4.10 — 从「调框」直接切过来时，btnAdjust 曾给当前页塞了一个
+        // inset 四角。用户没拖过角就不该让这一页被悄悄裁掉 3% 边框，否则全篇
+        // 会出现一页尺寸不同、页眉又冒出来的怪现象。
+        if (p && !p.quadManual && p.quad) { p.quad = null; p.fullWarp = null; }
+        if (p && !p.fullWarp) {
+          busy(true, '准备页面…');
+          await processPage(p);
+          busy(false);
+        }
+      }
+      roiDraft = null;
+      updateRoiState();
+      render();
+    };
+    $('btnRoiClear').onclick = function (e) { e.stopPropagation(); clearROI(); };
+
     // 工具条
     $('btnAdjust').onclick = function () {
       S.adjust = !S.adjust;
+      S.roiMode = false;   // modified：2.4.10 — 两种画布编辑模式互斥
       S.compare = false;
       var p = current();
-      if (S.adjust && p && !p.quad) p.quad = insetQuad(rotatedSource(p).width, rotatedSource(p).height);
+      if (S.adjust) {
+        if (p && !p.quad) p.quad = insetQuad(rotatedSource(p).width, rotatedSource(p).height);
+      } else if (p && !p.quadManual && p.quad) {
+        // modified：2.4.10 — 只是点开看看、没拖过角就退出：清掉自动生成的 inset
+        // 四角并重新处理，避免 autoQuad 关闭时这一页被悄悄裁掉一圈。
+        p.quad = null; p.fullWarp = null;
+        processPage(p);
+      }
       render();
     };
     $('btnRedetect').onclick = async function () {
@@ -1572,7 +1802,7 @@
     // 缩放
     $('zoomIn').onclick = function () {
       var p = current(); if (!p) return;
-      var img = S.adjust ? rotatedSource(p) : (p.result || rotatedSource(p));
+      var img = displayImage(p) || rotatedSource(p);
       var vp = $('viewport').getBoundingClientRect();
       var fit = Math.min((vp.width - 56) / img.width, (vp.height - 56) / img.height, 1);
       S.zoom = Math.min(4, (S.zoom || fit) * 1.25);
@@ -1637,6 +1867,7 @@
     });
 
     bindCornerDrag();
+    bindRoiDrag();   // modified：2.4.10
 
     // 便于自检/演示：index.html#demo 直接载入示例
     var zm = /zoom=([\d.]+)/.exec(location.hash);
@@ -1677,6 +1908,14 @@
   window.__docscan = {
     state: S,
     addFiles: addFiles,
+    setROI: function (r) {
+      S.roi = DocScan.normROI(r);
+      updateRoiState();
+      renderRoiLayer();
+      return applyAllPages();
+    },
+    clearROI: clearROI,
+    applyAllPages: applyAllPages,
     addCanvas: function (canvas, name) {
       S.pages.push(makePage(canvas, name || 'canvas', 'demo'));
       S.cur = S.pages.length - 1;

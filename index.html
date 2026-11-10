@@ -123,6 +123,8 @@
           </select>
         </label>
       </div>
+      <!-- modified：2.4.10 — 识别范围状态行：任务级设定，刷新/清空后不保留。 -->
+      <div class="roi-note" id="roiState" hidden></div>
       <button class="btn wide" id="btnApplyAll">应用参数到全部页</button>
     </section>
 
@@ -173,6 +175,8 @@
         <span class="pg-name" id="pgName">尚未导入文件</span>
       </div>
       <div class="tb-right">
+        <!-- modified：2.4.10 — 全篇识别范围：框外内容在进入二值化前被物理裁掉。 -->
+        <button class="tool" id="btnRoi" title="框选识别范围：整个文件每一页只保留方框内的内容，可用来排除页眉、页码、装订孔">识别范围</button>
         <button class="tool" id="btnAdjust" title="手动调框">调框</button>
         <button class="tool" id="btnCompare" title="按住对比原图">按住对比</button>
         <button class="tool" id="btnRotate" title="旋转 90°">旋转</button>
@@ -213,9 +217,22 @@
           <div class="handle" data-i="2"></div>
           <div class="handle" data-i="3"></div>
         </div>
+        <!-- modified：2.4.10 — 识别范围框选层：四块遮罩 + 框 + 四角把手。 -->
+        <div class="roilayer" id="roiLayer" hidden>
+          <div class="roi-shade" id="roiShadeT"></div>
+          <div class="roi-shade" id="roiShadeB"></div>
+          <div class="roi-shade" id="roiShadeL"></div>
+          <div class="roi-shade" id="roiShadeR"></div>
+          <div class="roi-box" id="roiBox"></div>
+          <div class="roi-tag" id="roiTag">识别范围</div>
+          <div class="roi-handle" data-c="nw"></div>
+          <div class="roi-handle" data-c="ne"></div>
+          <div class="roi-handle" data-c="sw"></div>
+          <div class="roi-handle" data-c="se"></div>
+        </div>
       </div>
 
-      <div class="badge" id="stageBadge" hidden>正在调框：拖动四角贴合纸张边缘</div>
+      <div class="badge" id="stageBadge" hidden><span id="stageBadgeTxt">正在调框：拖动四角贴合纸张边缘</span><button class="badge-btn" id="btnRoiClear" hidden>清除范围</button></div>
 
       <div class="busy" id="busy" hidden>
         <div class="spinner"></div>
@@ -304,6 +321,19 @@
       <p>判据是<b>页面的实际物理尺寸</b>，不是「看起来差不多」：导出 PDF 后直接读每页的 MediaBox。实测三页同尺寸白纸、正文行数 15/7/17，逐页裁 + 原比例导出得到 <code>833.79×841.89 / 841.89×399.60 / 736.26×841.89</code> 三种页尺寸；切「统一裁」后三页均为 <code>736.26×841.89</code>，一种尺寸。</p>
       <p class="muted"><b>何时会失效（工具会明确提示，不静默）</b>：① 各页处理尺寸差异超过 1.5%（例如合成稿或裁切稿没有真实纸边，被「检测纸张边缘」裁成了内容框），此时统一没有意义，会退回逐页裁并提示关掉纸张边缘检测；② 有页没按统一档处理过（改档位时只重算了当前页），会提示点「应用参数到全部页」；③ 只有一页时不做统一。<b>保真边界</b>：统一裁切只决定「留多少白」，不改变墨迹像素，也不做缩放；但裁掉的白边确实不可恢复，建议同时保留原始扫描件。</p>
 
+      <!-- modified：2.4.10 — 新增「识别范围」专节：物理过滤发生在识别之前，不是事后遮盖。 -->
+      <h3>一点八、识别范围（只认方框里的内容）</h3>
+      <p>有些东西<b>不该被当成正文</b>：页眉的密级与文号、页脚页码、装订孔黑影、扫描仪边缘的日期水印、骑缝章外侧的杂线。它们会污染背景估计与局部阈值，还会把「裁白边」的墨迹外框撑到整页——自动算法分不清「这是字」还是「这是不需要的字」。</p>
+      <p>工具栏「<b>识别范围</b>」让你在页面上直接拖一个框，这个框按<b>相对坐标</b>（0~1）记下来，<b>整份文件的每一页都按同一个框处理</b>。关键在于<b>它切在流水线的最前面</b>：四角校正之后、背景估计 / Sauvola 阈值 / 去噪 / 墨量统计 / 自动裁白边之前，框外像素就被<b>物理裁掉</b>了。所以页眉页码不是「被涂白盖住」，而是<b>根本没进入过识别</b>——1bit 输出里不存在被掩盖的内容，PDF 里也翻不出来。</p>
+      <ul>
+        <li><b>与「裁白边 / 统一裁」正交</b>：识别范围先切掉不要的区域，剩下的墨迹才参与求裁切框；两者可叠加，互不改写对方的坐标。</li>
+        <li><b>只裁、不缩放</b>：各页按相对坐标取整裁成同一尺寸，内容不重采样，也不会因框选多出灰阶锯齿。</li>
+        <li><b>相对坐标而非固定像素</b>：各页哪怕差几像素，页眉页脚仍在同一个相对位置；框越界一律夹回页内，整页框视为「不启用」。</li>
+        <li><b>随时回退</b>：松开鼠标即整批重算；「清除范围」立刻恢复整页。框选态的状态栏报的是<b>输出尺寸</b>并括注底图尺寸，不会把未裁整页误当成导出尺寸。</li>
+      </ul>
+      <p class="muted"><b>为什么它不跟着参数自动记忆</b>：识别范围是<b>这一份文件</b>的设定，不写进 <code>localStorage</code>。刷新页面本来就不会保留已导入的文件，若再让旧框跨文件沿用，下一份版心不同的公文会被<b>静默切掉正文</b>——这个代价远大于省一次框选。导出成功或点「清空任务」后自动失效。</p>
+      <p class="muted"><b>保真边界</b>：这是<b>物理删除</b>，比统一裁切更彻底，裁掉的内容在导出文件里不可恢复。DA/T 31—2017 第 10.4 条要求去污「不得去除档案页面原有的痕迹」，页眉、页码、装订孔本身也是档案信息；<b>本功能只宜用于自用副本、传阅件、打印件</b>，存档母本务必保留原始彩色扫描件。另外，若某页的版心明显偏移（歪斜未纠、幅面混装），同一个相对框可能切到正文——框选后请翻几页确认。</p>
+
       <h3>二、为什么默认 150KB / 页</h3>
       <p><b>DA/T 31—2017《纸质档案数字化规范》</b>：扫描分辨率不小于 200dpi，文字偏小、密集、清晰度较差时建议不小于 300dpi；并明确 <b>“页面中有红头、印章或插有照片、彩色插图的档案，应采用彩色模式进行扫描”</b> —— 这正是本工具“漂白但保留红头印章颜色”的规范依据。</p>
       <p>各地档案进馆的执行口径普遍是：<b>黑白二值 A4 单页 20–40KB，灰度或彩色 A4 单页 100–300KB</b>，彩色 PDF 单页上限 500KB。本工具默认 150KB，落在“彩色 100–300KB”区间中部，既满足移交要求，又便于微信/邮件传输。</p>
@@ -327,7 +357,7 @@
       <h3>五、参数会自动记住</h3>
       <!-- modified：2.4.5 — 新增参数持久化说明。 -->
       <p>所有界面设定在改动后自动存进浏览器本地（<code>localStorage</code> 里的 <code>docscan.settings.v1</code>），<b>刷新页面、关掉浏览器再打开、重启电脑，都会沿用上次的设定</b>——包括增强模式、纸张状况、六个滑杆、保留红头/印章、检测纸张边缘、去除边缘黑边、清理折痕/杂线、对开页拆分、自动纠偏、断笔接续、<b>接续档位</b>（2.4.7 新增）、<b>裁白边三档</b>（不裁 / 逐页 / 统一，2.4.9 由开关改为下拉，旧存档会自动迁移），以及“处理分辨 / 单页体积 / 页面”这一行输出设置。</p>
-      <p class="muted"><b>不保存的</b>：导入的文件与处理结果。关掉页面就没了——这是有意的，文件太大，也不该占浏览器的存储配额。</p>
+      <p class="muted"><b>不保存的</b>：导入的文件与处理结果。关掉页面就没了——这是有意的，文件太大，也不该占浏览器的存储配额。<b>识别范围（2.4.10）同样不保存</b>：它是「这一份文件」的设定，跨文件沿用会静默切掉版心不同的正文；清空任务或导出成功后即失效。</p>
       <p class="muted">几个边界：存储按“协议 + 主机 + 端口”隔离，用 8765 和 8766 打开是<b>两套独立设定</b>；隐私模式或浏览器禁用站点存储时保存会静默失败，功能照用、只是记不住；存档损坏或含非法值（手改过、旧版本残留）时按默认值降级，滑杆越界值会被夹回区间，下拉里不存在的选项会被忽略。「重置」会把<b>全部</b>参数（含开关与下拉）恢复默认，并把默认值存为下次的设定。想彻底清掉记忆：开发者工具 → Application → Local Storage → 删除 <code>docscan.settings.v1</code>。</p>
 
       <h3>六、参考的开源方案</h3>
@@ -343,6 +373,8 @@
       <!-- modified：2.4.9 — 补记统一裁切专项调研：ScanTailor 的 page size / unpaper 的边界约定，
            以及明确不采用的项（去扭曲、调色板压缩、OCR 层）。 -->
       <p class="muted"><b>2.4.9 统一裁切专项调研（ScanTailor Advanced / unpaper / OCRmyPDF / PDFarranger / noteshrink）</b>：① <b>ScanTailor Advanced</b> 把页面处理拆成「分割 → 去扭曲 → 选内容 → 页边距 → 输出」多阶段，<b>「选内容」只决定每页保留哪一块，「页边距 / 输出」才决定最终页面尺寸</b>，并支持与其他页匹配尺寸——这一分层正是本项目把「算框」与「裁切」拆开、再补一层全篇并集的依据；② <b>unpaper</b> 的 <code>--blackfilter / --noisefilter / --border</code> 与 OCRmyPDF 的 <code>--clean-final</code> 都强调<b>边界处理宁保守勿激进</b>（宁可留边，不可切字），本项目据此把并集夹到组内最小页、越界只补纸色；③ <b>PDFarranger / PDF 补丁丁</b> 的裁剪是「改 MediaBox 不动像素」，与本项目「只平移窗口、不重采样」同源：1bit 图一旦重采样，硬边缘就会长出灰阶锯齿。<b>明确未采用</b>：ScanTailor 的<b>去扭曲（dewarp）</b>需要书页三维形变模型与人工调曲线，本项目面向平板/手机拍摄的公文，透视校正已够；<b>noteshrink</b> 的 K-means 调色板压缩针对彩色插画，会改变彩色像素值，与「红头印章保原色」冲突；<b>OCRmyPDF</b> 的 OCR 层需要 tesseract 与后端，纯前端做不到。以上只借鉴思路，没有复制第三方源码；实现见 <code>core.js</code> 的 <code>trimBox / unifyCrop</code> 与 <code>app.js</code> 的 <code>computeUnifyBox / pageCanvas</code>。</p>
+      <!-- modified：2.4.10 — 补记「识别范围」专项调研与取舍。 -->
+      <p class="muted"><b>2.4.10 识别范围专项调研</b>：① <b>ScanTailor Advanced</b> 的 <b>Content Box / Page Box</b> 允许人工指定「内容区」，并与输出阶段分离，本项目据此把框选放在四角校正之后、所有识别之前；② <b>unpaper</b> 的 <code>--border</code>、<code>--no-blackfilter</code> 等边界选项与 ScanTailor 的 <b>match size with other pages</b> 说明「全篇共用同一区域」是成熟做法，本项目用相对坐标实现；③ <b>OCRmyPDF</b> 的 <code>--remove-background</code> / <code>--clean-final</code> 提醒：<b>遮盖与删除不是一回事</b>——把框外涂白会在 1bit 层里留下「曾经有内容」的处理痕迹，也可能被背景估计提前看到，因此本项目选物理裁掉；④ 图像型 PDF 的裁剪惯例（改 MediaBox 不动像素，PDFarranger / PDF 补丁丁）用于确定「只裁不缩放」。<b>明确未采用</b>：OCR 的「忽略区域」只在识别阶段过滤，PDF 里内容仍在；版面分析自动找版心则把判断交给模型，公文版心固定，人工拖一次更可控也更可溯源。实现见 <code>core.js</code> 的 <code>normROI / cropROI</code> 与 <code>app.js</code> 的 <code>bindRoiDrag / commitROI</code>。</p>
     </div>
   </div>
 </div>

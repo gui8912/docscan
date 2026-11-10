@@ -547,6 +547,96 @@ check('统一裁切：单页不做统一，框永不越界', function () {
   });
 });
 
+/* ---------------- 2.4.10 全篇识别范围（ROI） ---------------- */
+check('ROI 归一化：整页 / 非法 / 过小一律停用，越界夹回页内', function () {
+  assert(DocScan.normROI(null) === null, 'null 应停用');
+  assert(DocScan.normROI({ x: 0, y: 0, w: 1, h: 1 }) === null, '整页应停用');
+  assert(DocScan.normROI({ x: 0.1, y: 0.1, w: NaN, h: 0.5 }) === null, 'NaN 应停用');
+  assert(DocScan.normROI({ x: 0.1, y: 0.1, w: 0.01, h: 0.5 }) === null, '过小框应停用');
+  assert(DocScan.normROI({ x: -2, y: -1, w: 9, h: 9 }) === null, '钳到整页后应视为停用');
+  var q = DocScan.normROI({ x: 0.8, y: 0.8, w: 0.5, h: 0.5 });
+  assert(q && Math.abs(q.x + q.w - 1) < 1e-9 && Math.abs(q.y + q.h - 1) < 1e-9, '右下越界应夹回 1');
+  var ok = DocScan.normROI({ x: 0.1, y: 0.2, w: 0.7, h: 0.6 });
+  assert(ok && ok.w === 0.7 && ok.h === 0.6, '合法框应原样保留');
+});
+
+check('ROI 不启用时零拷贝，有效框才产出新缓冲', function () {
+  var d = blank(12, 8, [255, 255, 255]);
+  var r = DocScan.cropROI(d, 12, 8, null);
+  assert(r.data === d && r.cut === false && r.w === 12 && r.h === 8, '应原样返回');
+  var r2 = DocScan.cropROI(d, 12, 8, { x: 0, y: 0, w: 1, h: 1 });
+  assert(r2.data === d && r2.cut === false, '整页框应等价于不裁');
+  var r3 = DocScan.cropROI(d, 12, 8, { x: 0.5, y: 0.5, w: 0.5, h: 0.5 });
+  assert(r3.data !== d && r3.cut === true, '有效框必须真的产出新缓冲');
+});
+
+check('ROI 物理裁掉页眉与页码：框外像素不进入结果缓冲', function () {
+  var w = 60, h = 40, d = blank(w, h, [255, 255, 255]);
+  fill(d, w, 0, 1, w, 3, [0, 0, 0]);          // 页眉：整行
+  fill(d, w, 26, h - 3, 34, h - 1, [0, 0, 0]); // 页码
+  fill(d, w, 10, 18, 50, 20, [0, 0, 0]);      // 正文
+  var r = DocScan.cropROI(d, w, h, { x: 0.05, y: 0.15, w: 0.9, h: 0.7 });
+  assert(r.cut && r.rect.y === 6 && r.rect.h === 28, '裁切范围应与相对框一致');
+  function dark(a, W, y) {
+    var n = 0;
+    for (var x = 0; x < W; x++) if (lum(a, y * W + x) < 100) n++;
+    return n;
+  }
+  assert(dark(r.data, r.w, 0) === 0, '页眉不应出现在裁后第一行');
+  assert(dark(r.data, r.w, r.h - 1) === 0, '页码不应出现在裁后最后一行');
+  assert(dark(r.data, r.w, 12) > 20, '正文必须保留');
+  assert(dark(d, w, 2) > 0, 'cropROI 不得污染调用方数据');
+});
+
+check('ROI 相对坐标在两种页尺寸上比例一致且不越界', function () {
+  var roi = { x: 0.12, y: 0.1, w: 0.76, h: 0.8 };
+  var a = DocScan.cropROI(blank(200, 300, [255, 255, 255]), 200, 300, roi);
+  var b = DocScan.cropROI(blank(400, 600, [255, 255, 255]), 400, 600, roi);
+  assert(Math.abs(a.rect.x / 200 - b.rect.x / 400) < 0.01, 'x 比例应一致');
+  assert(Math.abs(a.w / 200 - b.w / 400) < 0.01 && Math.abs(a.h / 300 - b.h / 600) < 0.01, '尺寸比例应一致');
+  assert(a.rect.x + a.rect.w <= 200 && a.rect.y + a.rect.h <= 300, '不得越出页边界');
+  assert(b.rect.x + b.rect.w <= 400 && b.rect.y + b.rect.h <= 600, '不得越出页边界');
+});
+
+check('ROI 极端框：贴右下角、最小面积都不产出 0 尺寸', function () {
+  var d = blank(50, 30, [255, 255, 255]);
+  var r1 = DocScan.cropROI(d, 50, 30, { x: 0.98, y: 0.98, w: 0.02, h: 0.02 });
+  assert(r1.rect.x + r1.rect.w <= 50 && r1.rect.y + r1.rect.h <= 30, '右下角框必须被夹住');
+  assert(r1.w > 0 && r1.h > 0 && r1.data.length === r1.w * r1.h * 4, '缓冲长度必须自洽');
+  var r2 = DocScan.cropROI(d, 50, 30, { x: 0.5, y: 0.5, w: 0.02, h: 0.02 });
+  assert(r2.w >= 1 && r2.h >= 1, '最小框至少 1 像素');
+});
+
+check('ROI 与自动裁白边组合：页眉不再撑大墨迹外框', function () {
+  var w = 80, h = 60, d = blank(w, h, [255, 255, 255]);
+  fill(d, w, 2, 2, 78, 4, [0, 0, 0]);        // 页眉横跨整页
+  fill(d, w, 20, 25, 30, 27, [0, 0, 0]);     // 正文一小块
+  var full = run(d, w, h, { trim: true });
+  var r = DocScan.cropROI(d, w, h, { x: 0, y: 0.15, w: 1, h: 0.8 });
+  var cut = run(r.data, r.w, r.h, { trim: true });
+  assert(full.box.w > cut.box.w, '有页眉时整页墨迹框应更宽');
+  assert(cut.preW === r.w && cut.preH === r.h, '裁前尺寸应等于 ROI 后的画布');
+});
+
+check('ROI 与统一裁切组合：各页框仍自洽，unifyCrop 给出共用框', function () {
+  var roi = { x: 0.08, y: 0.1, w: 0.84, h: 0.8 };
+  var items = [];
+  for (var i = 0; i < 3; i++) {
+    var w = 100, h = 140, d = blank(w, h, [255, 255, 255]);
+    fill(d, w, 20 + i * 4, 40, 60 + i * 4, 42, [0, 0, 0]);
+    var cr = DocScan.cropROI(d, w, h, roi);
+    var r = run(cr.data, cr.w, cr.h, { trim: true });
+    items.push({ key: 'p' + i, preW: r.preW, preH: r.preH, box: r.box });
+    assert(r.box.x >= 0 && r.box.x + r.box.w <= r.preW, '裁切框必须落在 ROI 画布内');
+  }
+  var u = DocScan.unifyCrop(items, 0.015);
+  assert(u && u.count === 3, '三页应能求出共用框');
+  for (var k in u.rects) {
+    var q = u.rects[k];
+    assert(q.x >= 0 && q.x + q.w <= items[0].preW, '共用框不得越界');
+  }
+});
+
 Promise.all(pending).then(function () {
   console.log('\n通过 ' + passed + ' 项，失败 ' + failed + ' 项' +
     (skipped ? '，跳过 ' + skipped + ' 项（当前 Node 缺 DecompressionStream）' : '') + '\n');

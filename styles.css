@@ -251,9 +251,42 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border:2px solid #3d8
 .badge{
   position:absolute;left:50%;top:12px;transform:translateX(-50%);
   background:rgba(10,15,22,.92);border:1px solid rgba(61,139,255,.35);color:#9dc4ff;
-  font-size:11.5px;padding:5px 12px;border-radius:20px;white-space:nowrap;z-index:6;
+  /* modified：2.4.10 — 提到框选层之上，否则「清除范围」按钮点不到 */
+  font-size:11.5px;padding:5px 12px;border-radius:20px;white-space:nowrap;z-index:20;
   box-shadow:0 6px 18px rgba(0,0,0,.5);
 }
+/* modified：2.4.10 — 识别范围框选层。四块遮罩独立定位，避免 box-shadow 盖住把手。 */
+.roilayer{position:absolute;inset:0;z-index:7;cursor:crosshair;touch-action:none}
+.roi-shade{position:absolute;background:rgba(6,10,16,.66);pointer-events:none}
+.roi-box{
+  position:absolute;border:2px solid #3d8bff;background:rgba(61,139,255,.07);
+  box-shadow:inset 0 0 0 1px rgba(0,0,0,.5);pointer-events:none;
+}
+/* 标签用独立元素而非 ::after：伪元素在百分比高度的框里会被压成一条细线 */
+.roi-tag{
+  position:absolute;z-index:2;font-size:11px;line-height:1.5;color:#fff;
+  background:rgba(61,139,255,.92);padding:2px 7px;border-radius:3px;
+  white-space:nowrap;pointer-events:none;
+}
+.roi-handle{
+  position:absolute;width:14px;height:14px;border:2.5px solid #3d8bff;background:#0b1017;
+  transform:translate(-50%,-50%);pointer-events:auto;box-shadow:0 0 0 3px rgba(61,139,255,.2),0 2px 8px rgba(0,0,0,.6);
+}
+.roi-handle[data-c="nw"],.roi-handle[data-c="se"]{cursor:nwse-resize}
+.roi-handle[data-c="ne"],.roi-handle[data-c="sw"]{cursor:nesw-resize}
+.roi-handle:hover{background:#3d8bff}
+.badge-btn{
+  margin-left:8px;padding:2px 8px;font-size:10.5px;color:#cfe2ff;cursor:pointer;
+  background:rgba(61,139,255,.18);border:1px solid rgba(61,139,255,.5);border-radius:11px;
+}
+.badge-btn:hover{background:rgba(61,139,255,.36);color:#fff}
+.roi-note{
+  font-size:10.5px;color:var(--dim2);line-height:1.5;margin:2px 0 8px;
+  padding:6px 8px;border:1px dashed rgba(61,139,255,.35);border-radius:6px;
+  background:rgba(61,139,255,.05);
+}
+.roi-note b{color:#9dc4ff;font-weight:600}
+.roi-note a{color:#9dc4ff;cursor:pointer;text-decoration:underline;margin-left:6px}
 .trio{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:8px}
 .trio label{display:block}
 .trio label span{display:block;font-size:10.5px;color:var(--dim2);margin-bottom:4px}

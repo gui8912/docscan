@@ -1042,6 +1042,53 @@
     return out;
   }
 
+  /* modified：2.4.10 — 全篇「识别范围」(ROI)。
+   * 相对坐标 {x,y,w,h} ∈ [0,1]，作用在四角校正之后、任何识别/增强之前：
+   * 框外像素被物理裁掉，页眉、页码、装订孔、边缘黑边根本不进入
+   * 背景估计、Sauvola 阈值、墨量统计、去噪与自动裁白边。
+   * 借鉴 ScanTailor Advanced 的 content box 与 unpaper 的 --border，
+   * 但这里是「裁掉」而不是「涂白」：1bit 输出里不存在被掩盖的内容。
+   * 与「裁白边 / 统一裁切」正交：ROI 先切掉不需要的区域，之后才按剩余墨迹求框。 */
+  var ROI_MIN = 0.02;
+
+  /** 归一化相对框；非法 / 过小 / 覆盖整页一律返回 null（= 不启用）。 */
+  function normROI(r) {
+    if (!r || typeof r !== 'object') return null;
+    var x = +r.x, y = +r.y, w = +r.w, h = +r.h;
+    if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h)) return null;
+    x = x < 0 ? 0 : (x > 1 ? 1 : x);
+    y = y < 0 ? 0 : (y > 1 ? 1 : y);
+    w = w < 0 ? 0 : (w > 1 ? 1 : w);
+    h = h < 0 ? 0 : (h > 1 ? 1 : h);
+    if (x + w > 1) w = 1 - x;
+    if (y + h > 1) h = 1 - y;
+    if (x >= 1 || y >= 1 || w < ROI_MIN || h < ROI_MIN) return null;
+    // 覆盖整页时视为「未启用」，省掉一次全图拷贝
+    if (x <= 0 && y <= 0 && w >= 1 && h >= 1) return null;
+    return { x: x, y: y, w: w, h: h };
+  }
+
+  /** 按相对框物理裁 RGBA。返回 {data,w,h,rect,cut}；cut=false 时 data 是原引用。 */
+  function cropROI(data, w, h, r) {
+    var full = { data: data, w: w, h: h, rect: { x: 0, y: 0, w: w, h: h }, cut: false };
+    var q = normROI(r);
+    if (!q || !(w > 0) || !(h > 0) || !data || data.length < w * h * 4) return full;
+    var x0 = Math.round(q.x * w), y0 = Math.round(q.y * h);
+    var cw = Math.max(1, Math.round(q.w * w)), ch = Math.max(1, Math.round(q.h * h));
+    x0 = Math.max(0, Math.min(w - 1, x0));
+    y0 = Math.max(0, Math.min(h - 1, y0));
+    if (x0 + cw > w) cw = w - x0;
+    if (y0 + ch > h) ch = h - y0;
+    if (cw < 1 || ch < 1) return full;
+    if (x0 === 0 && y0 === 0 && cw === w && ch === h) return full;
+    var out = new Uint8ClampedArray(cw * ch * 4), rb = cw << 2;
+    for (var y = 0; y < ch; y++) {
+      var s = ((y + y0) * w + x0) << 2;
+      out.set(data.subarray(s, s + rb), y * rb);
+    }
+    return { data: out, w: cw, h: ch, rect: { x: x0, y: y0, w: cw, h: ch }, cut: true };
+  }
+
   function cropFloat(src, w, h, x0, y0, cw, ch) {
     if (x0 === 0 && y0 === 0 && cw === w && ch === h) return src;
     var out = new Float32Array(cw * ch);
@@ -1995,7 +2042,9 @@
     // modified：2.4.4 — 输出长边上限跟随"处理分辨"，修复三档体积几乎无差别。
     // modified：2.4.3 — 导出文件名与源文件一致、可写回源文件覆盖、导出后自动清空工作栏。
     // modified：2.4.2 — 复审修复彩色候选基准（泛黄纸整页判墨）、无损校验长度判定与公共设施问题。
-    version: '2.4.9',
+    // modified：2.4.10 — 新增全篇「识别范围」：四角校正后物理裁掉框外像素，
+    // 页眉/页码/装订孔不进入任何识别统计；与自动裁白边、统一裁切正交叠加。
+    version: '2.4.10',
     defaults: DEFAULTS,
     presets: PRESETS,
     process: process,
@@ -2011,6 +2060,9 @@
     reframe: reframe,
     // modified：2.4.9 — 全篇统一裁切框（输入各页裁前尺寸与裁切框，输出共用框）
     unifyCrop: unifyCrop,
+    // modified：2.4.10 — 识别范围（相对坐标归一化 + 物理裁剪），供交互层与自检调用
+    normROI: normROI,
+    cropROI: cropROI,
     // 供基准测试 / 单元测试
     _internals: {
       estimateBackground: estimateBackground,
